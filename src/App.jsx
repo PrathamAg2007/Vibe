@@ -7,6 +7,7 @@ import { initScroll, destroyScroll, unlockScroll } from './engine/scroll.js';
 import { getPalette } from './engine/palette.js';
 import { age } from './engine/age.js';
 import { initAudio, setAudioAge, setMuted, isMuted, onTap } from './engine/audio.js';
+import { getMorphingLayout } from './engine/labels.js';
 import Objects from './layers/Objects.jsx';
 
 export default function App() {
@@ -16,6 +17,8 @@ export default function App() {
   const spacerRef = useRef(null);
   const ageCounterRef = useRef(null);
   const oklchReadoutRef = useRef(null);
+  const utilityLeftRef = useRef(null);
+  const creditsRef = useRef(null);
   const dragStartRef = useRef(null);
 
   // Wire tap listener from audio engine
@@ -50,7 +53,11 @@ export default function App() {
     let lastParticleHex = '';
     const onTick = () => {
       const current = age.value;
-      if (Math.abs(current - lastAudioAge) > 0.003) {
+      if (
+        Math.abs(current - lastAudioAge) > 0.002 ||
+        (current >= 0.97 && lastAudioAge < 0.97) ||
+        (current < 0.95 && lastAudioAge >= 0.95)
+      ) {
         lastAudioAge = current;
         setAudioAge(current);
       }
@@ -63,6 +70,13 @@ export default function App() {
       if (p.particle.hex !== lastParticleHex) {
         lastParticleHex = p.particle.hex;
         document.documentElement.style.setProperty('--particle-color', p.particle.hex);
+      }
+      const layout = getMorphingLayout(current, window.innerWidth, window.innerHeight);
+      if (utilityLeftRef.current) {
+        utilityLeftRef.current.style.transform = `translate3d(0, ${layout.uiYOffset.toFixed(2)}px, 0) rotate(${layout.uiRotation.toFixed(2)}deg)`;
+      }
+      if (creditsRef.current) {
+        creditsRef.current.style.transform = `translate3d(0, ${layout.uiYOffset.toFixed(2)}px, 0) rotate(${layout.creditsRotation.toFixed(2)}deg)`;
       }
     };
     gsap.ticker.add(onTick);
@@ -140,37 +154,52 @@ export default function App() {
         </div>
       )}
 
-      {/* OKLCH lock readout in IBM Plex Mono 11px */}
+      {/* Bottom utility UI: OKLCH lock readout, age counter, mute toggle */}
       <div
-        ref={oklchReadoutRef}
-        id="oklch-readout"
-        className="fixed bottom-10 left-6 z-20 font-mono text-[11px] tracking-wider select-none text-[var(--particle-color)] opacity-70 pointer-events-none"
+        ref={utilityLeftRef}
+        className="fixed bottom-4 left-6 z-20 flex flex-col gap-2 font-mono select-none text-[var(--particle-color)] pointer-events-none ui-morph-left"
+        style={{
+          transformOrigin: 'left bottom',
+          willChange: 'transform'
+        }}
       >
-        oklch lock on / h 32
-      </div>
-
-      {/* Small age counter and mute toggle in bottom corner */}
-      <div className="fixed bottom-4 left-6 z-20 flex items-center gap-4 font-mono text-xs tracking-wider select-none text-[var(--particle-color)] pointer-events-none">
-        <span
-          ref={ageCounterRef}
-          id="age-counter"
-          className="tabular-nums opacity-60"
+        <div
+          ref={oklchReadoutRef}
+          id="oklch-readout"
+          className="text-[11px] tracking-wider opacity-70"
         >
-          0 yrs
-        </span>
-        <button
-          type="button"
-          id="mute-toggle"
-          onClick={handleToggleMute}
-          className="pointer-events-auto opacity-60 hover:opacity-100 transition-opacity duration-200 cursor-pointer bg-transparent border-none p-0 text-inherit font-inherit font-mono text-xs tracking-wider"
-          aria-label={muted ? 'Unmute audio' : 'Mute audio'}
-        >
-          {muted ? 'sound off' : 'sound on'}
-        </button>
+          oklch lock on / h 32
+        </div>
+        <div className="flex items-center gap-4 text-xs tracking-wider">
+          <span
+            ref={ageCounterRef}
+            id="age-counter"
+            className="tabular-nums opacity-60"
+          >
+            0 yrs
+          </span>
+          <button
+            type="button"
+            id="mute-toggle"
+            onClick={handleToggleMute}
+            className="pointer-events-auto opacity-60 hover:opacity-100 transition-opacity duration-200 cursor-pointer bg-transparent border-none p-0 text-inherit font-inherit font-mono text-xs tracking-wider"
+            aria-label={muted ? 'Unmute audio' : 'Mute audio'}
+          >
+            {muted ? 'sound off' : 'sound on'}
+          </button>
+        </div>
       </div>
 
       {/* Credits line, always visible, tiny */}
-      <div className="fixed bottom-4 right-5 z-20 text-[10px] font-mono tracking-wide opacity-50 pointer-events-none select-none">
+      <div
+        ref={creditsRef}
+        id="credits-readout"
+        className="fixed bottom-4 right-5 z-20 text-[10px] font-mono tracking-wide opacity-50 pointer-events-none select-none ui-morph-right"
+        style={{
+          transformOrigin: 'right bottom',
+          willChange: 'transform'
+        }}
+      >
         Astronaut by Poly by Google [CC-BY] via Poly Pizza
       </div>
 

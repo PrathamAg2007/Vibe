@@ -215,3 +215,13 @@ canvas {
   font-family: var(--font-utility) !important;
   font-weight: 400;
 }
+
+.ui-morph-left {
+  transform-origin: left bottom;
+  will-change: transform;
+}
+
+.ui-morph-right {
+  transform-origin: right bottom;
+  will-change: transform;
+}

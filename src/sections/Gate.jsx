@@ -1,5 +1,6 @@
 import { memo, useEffect, useState } from 'react';
-import { initAudio } from '../engine/audio.js';
+import * as Tone from 'tone';
+import { initAudio, setAudioReady } from '../engine/audio.js';
 import { TextGenerateEffect } from '../components/library/text-generate-effect';
 
 function Gate({ onEnter }) {
@@ -20,11 +21,18 @@ function Gate({ onEnter }) {
     if (isFading || isGone) return;
     setIsFading(true);
 
-    // Initialize procedural audio engine on user interaction
+    // Call and await Tone.start() directly inside the handler, then start Transport, then set audioReady
     try {
+      await Tone.start();
+      Tone.getTransport().start();
+      setAudioReady(true);
+      if (Tone.getContext().state !== 'running') {
+        await Tone.getContext().resume();
+      }
+      console.log('[audio] state', Tone.getContext().state);
       await initAudio();
     } catch (err) {
-      console.warn('Audio init failed:', err);
+      console.warn('[audio] start failed:', err);
     }
 
     if (onEnter) {

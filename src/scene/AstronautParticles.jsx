@@ -13,7 +13,7 @@ import {
   registerAstronautTester,
   unregisterAstronautTester
 } from '../engine/input.js';
-import { getLevel } from '../engine/audio.js';
+import { getLevel, onEndingNote } from '../engine/audio.js';
 
 // 1. Preload GLB via useGLTF
 useGLTF.preload('/models/astronaut.glb');
@@ -500,6 +500,68 @@ function AstronautParticles({ hasEntered = false, onReady }) {
       blending: THREE.NormalBlending
     });
 
+    // Single soft-edged point at the astronaut's chest in the ember colour
+    // (smoothstep edge, no halo, no radial gradient orb, no bloom)
+    const emberGeometry = new THREE.BufferGeometry();
+    emberGeometry.setAttribute(
+      'position',
+      new THREE.BufferAttribute(new Float32Array([0.0, 0.42, 0.67]), 3)
+    );
+
+    const emberMaterial = new THREE.ShaderMaterial({
+      vertexShader: `
+        uniform float uSize;
+        uniform float uPixelRatio;
+        uniform float uBaseDistance;
+        uniform float uPulse;
+
+        void main() {
+          vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+          gl_Position = projectionMatrix * mvPosition;
+          float dist = -mvPosition.z;
+          float pulseScale = 1.0 + 0.15 * uPulse;
+          gl_PointSize = (uSize * pulseScale * (uBaseDistance / dist)) * (uPixelRatio / 1.5);
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 uEmberColor;
+        uniform float uAlpha;
+        uniform float uPulse;
+
+        void main() {
+          float dist = length(gl_PointCoord - vec2(0.5));
+          if (dist > 0.5) discard;
+          // Smoothstep edge, no halo, no radial gradient orb, no bloom
+          float edgeAlpha = 1.0 - smoothstep(0.18, 0.50, dist);
+          vec3 col = uEmberColor * (1.0 + 0.35 * uPulse);
+          gl_FragColor = vec4(col, uAlpha * edgeAlpha);
+        }
+      `,
+      uniforms: {
+        uSize: { value: 13.0 },
+        uPixelRatio: { value: dpr },
+        uBaseDistance: { value: 6.5 },
+        uEmberColor: { value: new THREE.Vector3(0.95, 0.62, 0.22) },
+        uAlpha: { value: 0.0 },
+        uPulse: { value: 0.0 }
+      },
+      transparent: true,
+      depthTest: true,
+      depthWrite: false,
+      blending: THREE.NormalBlending
+    });
+
+    const emberPoint = new THREE.Points(emberGeometry, emberMaterial);
+    emberPoint.matrixAutoUpdate = false;
+    emberPoint.frustumCulled = false;
+    emberPoint.visible = false;
+    scene.add(emberPoint);
+
+    let endingPulse = 0.0;
+    const unsubEndingNote = onEndingNote(() => {
+      endingPulse = 1.0;
+    });
+
     let pointsObject = null;
     let geometry = null;
     const preallocatedBoxSize = new THREE.Vector3();
@@ -557,10 +619,15 @@ function AstronautParticles({ hasEntered = false, onReady }) {
         const dH = (preallocatedBoxSize.x / 2) / (fovTan * camera.aspect) * 1.35;
         const fitDist = Math.max(dV, dH);
         material.uniforms.uBaseDistance.value = fitDist;
+        emberMaterial.uniforms.uBaseDistance.value = fitDist;
       }
     };
 
     window.addEventListener('resize', onResize);
+
+    let endingActive = false;
+    let endingAlpha = 0.0;
+    let lastFrameTime = performance.now();
 
     // 4. Exactly one animation loop: check isDisposed at top, no allocations
     const animate = () => {
@@ -568,12 +635,51 @@ function AstronautParticles({ hasEntered = false, onReady }) {
       animationFrameId = requestAnimationFrame(animate);
 
       const currentTime = performance.now();
+      const currentAge = age.value;
       material.uniforms.uTime.value = (currentTime - startTime) * 0.001;
-      material.uniforms.uAge.value = age.value;
+      material.uniforms.uAge.value = currentAge;
       material.uniforms.uAudio.value = getLevel();
 
       // Update particle color via in-place mutation without allocations
-      updateParticleColorAtAge(age.value, material.uniforms.uParticleColor.value);
+      updateParticleColorAtAge(currentAge, material.uniforms.uParticleColor.value);
+
+      // Ending ember point state with hysteresis:
+      // ON when age >= 0.97, OFF when age < 0.95
+      if (currentAge >= 0.97) {
+        endingActive = true;
+      } else if (currentAge < 0.95) {
+        endingActive = false;
+      }
+
+      // Eased alpha transition over 1.0s
+      const dt = Math.min(0.1, (currentTime - lastFrameTime) * 0.001);
+      lastFrameTime = currentTime;
+
+      if (endingActive && currentAge >= 0.95) {
+        endingAlpha = Math.min(1.0, endingAlpha + dt / 1.0);
+      } else {
+        endingAlpha = Math.max(0.0, endingAlpha - dt / 1.0);
+      }
+
+      // Decay pulse from ending notes
+      if (endingPulse > 0.001) {
+        endingPulse = Math.max(0.0, endingPulse - dt * 1.8);
+      } else {
+        endingPulse = 0.0;
+      }
+
+      if (endingAlpha > 0.001) {
+        emberPoint.visible = true;
+        const p = getPalette(currentAge);
+        if (p.ember) {
+          emberMaterial.uniforms.uEmberColor.value.set(p.ember.r, p.ember.g, p.ember.b);
+        }
+        emberMaterial.uniforms.uAlpha.value = endingAlpha;
+        emberMaterial.uniforms.uPulse.value = endingPulse;
+      } else {
+        emberPoint.visible = false;
+        emberMaterial.uniforms.uAlpha.value = 0.0;
+      }
 
       // Handle assembly & slow nod
       if (assembleStartTimeRef.current !== null) {
@@ -613,14 +719,21 @@ function AstronautParticles({ hasEntered = false, onReady }) {
       cancelAnimationFrame(animationFrameId);
       window.removeEventListener('resize', onResize);
 
+      unsubEndingNote();
       unregisterControls();
       unregisterAstronautTester();
       controls.dispose();
       material.dispose();
+      emberGeometry.dispose();
+      emberMaterial.dispose();
 
       if (pointsObject) {
         scene.remove(pointsObject);
         pointsObject = null;
+      }
+
+      if (emberPoint) {
+        scene.remove(emberPoint);
       }
 
       renderer.dispose();

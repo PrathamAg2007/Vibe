@@ -1,5 +1,17 @@
 import * as Tone from 'tone';
 
+export { Tone };
+
+export let audioReady = false;
+
+export function setAudioReady(ready = true) {
+  audioReady = Boolean(ready);
+}
+
+export function isAudioReady() {
+  return audioReady;
+}
+
 let isAudioInitialized = false;
 let isAudioMuted = false;
 let currentAudioAge = 0;
@@ -16,6 +28,14 @@ let musicBox = null;
 let pad = null;
 let subRoot = null;
 let sequence = null;
+let endingSequence = null;
+
+// Ending state tracker with hysteresis (ON when age >= 0.97, OFF when age < 0.95)
+let isEnding = false;
+let endingStartTime = 0;
+let endingFadeOutStartTime = 0;
+let isEndingFadingOut = false;
+const endingNoteCallbacks = new Set();
 
 // Shared mutable audio level object (like age.js)
 export const audioLevel = {
@@ -23,10 +43,32 @@ export const audioLevel = {
 };
 
 export function getLevel() {
-  if (!isAudioInitialized || isAudioMuted) {
+  if (!audioReady || !isAudioInitialized || isAudioMuted) {
     return 0;
   }
   return audioLevel.value;
+}
+
+export function isEndingActive() {
+  return isEnding;
+}
+
+export function onEndingNote(callback) {
+  if (typeof callback === 'function') {
+    endingNoteCallbacks.add(callback);
+    return () => endingNoteCallbacks.delete(callback);
+  }
+  return () => {};
+}
+
+function notifyEndingNote() {
+  endingNoteCallbacks.forEach((cb) => {
+    try {
+      cb();
+    } catch (err) {
+      console.warn('onEndingNote error:', err);
+    }
+  });
 }
 
 // Fixed 16-step quarter-note melody WITH REAL RESTS, exported as constant MOTIF:
@@ -98,18 +140,18 @@ export function isMuted() {
 
 export function setMuted(mute) {
   isAudioMuted = Boolean(mute);
-  if (isAudioInitialized) {
-    const dest = Tone.getDestination();
-    if (dest && dest.volume) {
-      if (isAudioMuted) {
-        dest.volume.rampTo(-Infinity, 0.2);
-        audioLevel.value = 0;
-      } else {
-        dest.volume.rampTo(0, 0.2);
-      }
-    }
-  } else {
+  if (!audioReady || !isAudioInitialized) {
     audioLevel.value = 0;
+    return;
+  }
+  const dest = Tone.getDestination();
+  if (dest && dest.volume) {
+    if (isAudioMuted) {
+      dest.volume.rampTo(-Infinity, 0.2);
+      audioLevel.value = 0;
+    } else {
+      dest.volume.rampTo(0, 0.2);
+    }
   }
 }
 
@@ -122,7 +164,7 @@ export function onTap(callback) {
 }
 
 function triggerMusicBoxNote(freq, dur, time, vel) {
-  if (!musicBox) return;
+  if (!audioReady || !musicBox) return;
   // Voice stealing: if all 6 voices are occupied, steal the oldest voice to avoid dropping notes
   if (musicBox._activeVoices && musicBox._activeVoices.length >= (musicBox.maxPolyphony || 6)) {
     const oldest = musicBox._activeVoices[0];
@@ -141,7 +183,7 @@ function triggerMusicBoxNote(freq, dur, time, vel) {
 }
 
 function handleTap(clientX, clientY) {
-  if (!isAudioInitialized || !musicBox) return;
+  if (!audioReady || !isAudioInitialized || !musicBox) return;
 
   const now = performance.now();
   if (now - lastTapTime < 60) return; // Debounce rapid double triggers
@@ -169,10 +211,10 @@ function handleTap(clientX, clientY) {
   const rawNote = TAP_NOTES[noteIdx];
 
   // The tapped note goes through the SAME instrument, filter, reverb and minorMix
-  const freq = getAdjustedFrequency(rawNote, currentMinorMix);
+  const freq = isEnding ? Tone.Frequency(rawNote).toFrequency() : getAdjustedFrequency(rawNote, currentMinorMix);
 
   // Velocity 0.9 to 0.5 with age
-  const vel = 0.9 - 0.4 * currentAudioAge;
+  const vel = isEnding ? 0.5 : (0.9 - 0.4 * currentAudioAge);
 
   triggerMusicBoxNote(freq, '4n', undefined, vel);
 
@@ -187,7 +229,84 @@ function handleTap(clientX, clientY) {
 }
 
 export function triggerTapNote(clientX, clientY) {
+  if (!audioReady || !isAudioInitialized) return;
   handleTap(clientX, clientY);
+}
+
+function getMainFadeMult() {
+  if (!isEnding) {
+    if (isEndingFadingOut) {
+      const elapsed = (performance.now() - endingFadeOutStartTime) * 0.001;
+      if (elapsed >= 1.0) {
+        isEndingFadingOut = false;
+        return 1.0;
+      }
+      return elapsed / 1.0;
+    }
+    return 1.0;
+  } else {
+    const elapsed = (performance.now() - endingStartTime) * 0.001;
+    if (elapsed >= 1.0) {
+      return 0.0;
+    }
+    return 1.0 - elapsed / 1.0;
+  }
+}
+
+function startEnding() {
+  if (!audioReady || !isAudioInitialized || isEnding) return;
+  isEnding = true;
+  isEndingFadingOut = false;
+  endingStartTime = performance.now();
+
+  // 1. Fade pad and subRoot to 0 over 1 s (-60 dB)
+  if (pad) pad.volume.rampTo(-60, 1.0);
+  if (subRoot) subRoot.volume.rampTo(-60, 1.0);
+
+  // 2. Open lowpass filter to about 1800 Hz over 1 s
+  if (filter) filter.frequency.rampTo(1800, 1.0);
+
+  // 3. Raise reverb wet to about 0.75 over 1 s
+  if (reverb) reverb.wet.rampTo(0.75, 1.0);
+
+  // 4. Detune to 0 on melody
+  if (musicBox) musicBox.set({ detune: 0 });
+
+  // 5. Start ending sequence at Tone.now() + 1.0 (after 1 s fade of main melody)
+  if (endingSequence) {
+    endingSequence.stop();
+    endingSequence.position = 0;
+    endingSequence.start('+1.0');
+  }
+}
+
+function stopEnding() {
+  if (!audioReady || !isAudioInitialized || !isEnding) return;
+  isEnding = false;
+  isEndingFadingOut = true;
+  endingFadeOutStartTime = performance.now();
+
+  // Stop ending motif immediately
+  if (endingSequence) {
+    endingSequence.stop();
+    endingSequence.position = 0;
+  }
+
+  // Restore age-mapped values over 1 s:
+  const targetCutoff = 6000 * Math.pow(500 / 6000, currentAudioAge);
+  if (filter) filter.frequency.rampTo(targetCutoff, 1.0);
+
+  const targetWet = 0.15 + 0.50 * currentAudioAge;
+  if (reverb) reverb.wet.rampTo(targetWet, 1.0);
+
+  const targetPadVol = -16 + 8 * currentAudioAge;
+  if (pad) pad.volume.rampTo(targetPadVol, 1.0);
+
+  const targetSubVol = -26 + 6 * currentAudioAge;
+  if (subRoot) subRoot.volume.rampTo(targetSubVol, 1.0);
+
+  const targetDetune = 20 * currentAudioAge;
+  if (musicBox) musicBox.set({ detune: targetDetune });
 }
 
 export function setAudioAge(newAge) {
@@ -196,48 +315,66 @@ export function setAudioAge(newAge) {
   currentDensity = 1.0 - 0.7 * a;
   currentMinorMix = smoothstep(0.4, 0.8, a);
 
-  if (!isAudioInitialized) return;
+  if (!audioReady || !isAudioInitialized) return;
 
-  // 1. bpm: 100 to 56
-  const targetBpm = 100 - 44 * a;
-  Tone.getTransport().bpm.rampTo(targetBpm, 0.2);
-
-  // 2. lowpass cutoff: 6000 Hz to 500 Hz, exponential feel
-  const targetCutoff = 6000 * Math.pow(500 / 6000, a);
-  filter.frequency.rampTo(targetCutoff, 0.2);
-
-  // 3. reverb wet: 0.15 to 0.65
-  const targetWet = 0.15 + 0.50 * a;
-  reverb.wet.rampTo(targetWet, 0.2);
-
-  // 4. detune: 0 to 20 cents on the melody
-  const targetDetune = 20 * a;
-  musicBox.set({ detune: targetDetune });
-  if (musicBox._voices) {
-    musicBox._voices.forEach((v) => {
-      if (v.detune && typeof v.detune.rampTo === 'function') {
-        v.detune.rampTo(targetDetune, 0.2);
-      }
-    });
+  // State: ending ON when age >= 0.97, OFF when age < 0.95 (hysteresis)
+  if (a >= 0.97) {
+    if (!isEnding) {
+      startEnding();
+    }
+  } else if (a < 0.95) {
+    if (isEnding) {
+      stopEnding();
+    }
   }
 
-  // 5. Pad volume rises with age
-  const targetPadVol = -16 + 8 * a;
-  pad.volume.rampTo(targetPadVol, 0.2);
-  const targetSubVol = -26 + 6 * a;
-  subRoot.volume.rampTo(targetSubVol, 0.2);
+  if (!isEnding) {
+    // 1. bpm: 100 to 56
+    const targetBpm = 100 - 44 * a;
+    Tone.getTransport().bpm.rampTo(targetBpm, 0.2);
+
+    // 2. lowpass cutoff: 6000 Hz to 500 Hz, exponential feel
+    const targetCutoff = 6000 * Math.pow(500 / 6000, a);
+    if (filter) filter.frequency.rampTo(targetCutoff, 0.2);
+
+    // 3. reverb wet: 0.15 to 0.65
+    const targetWet = 0.15 + 0.50 * a;
+    if (reverb) reverb.wet.rampTo(targetWet, 0.2);
+
+    // 4. detune: 0 to 20 cents on the melody
+    const targetDetune = 20 * a;
+    if (musicBox) {
+      musicBox.set({ detune: targetDetune });
+      if (musicBox._voices) {
+        musicBox._voices.forEach((v) => {
+          if (v.detune && typeof v.detune.rampTo === 'function') {
+            v.detune.rampTo(targetDetune, 0.2);
+          }
+        });
+      }
+    }
+
+    // 5. Pad volume rises with age (unless fading out)
+    if (!isEndingFadingOut) {
+      const targetPadVol = -16 + 8 * a;
+      if (pad) pad.volume.rampTo(targetPadVol, 0.2);
+      const targetSubVol = -26 + 6 * a;
+      if (subRoot) subRoot.volume.rampTo(targetSubVol, 0.2);
+    }
+  }
 }
 
 // Animation frame meter updater: normalised level 0 to 1 with fast attack and slow release
 let currentMeterLevel = 0;
 let lastMeterTime = typeof performance !== 'undefined' ? performance.now() : 0;
+let meterRafId = null;
 
 function updateMeterLoop(time) {
-  if (typeof requestAnimationFrame !== 'undefined') {
-    requestAnimationFrame(updateMeterLoop);
+  if (meterRafId !== null && typeof requestAnimationFrame !== 'undefined') {
+    meterRafId = requestAnimationFrame(updateMeterLoop);
   }
 
-  if (!isAudioInitialized || isAudioMuted || !meter) {
+  if (!audioReady || !isAudioInitialized || isAudioMuted || !meter) {
     currentMeterLevel = 0;
     audioLevel.value = 0;
     lastMeterTime = time;
@@ -269,18 +406,30 @@ function updateMeterLoop(time) {
   audioLevel.value = currentMeterLevel;
 }
 
-if (typeof requestAnimationFrame !== 'undefined') {
-  requestAnimationFrame(updateMeterLoop);
+function startMeterLoop() {
+  if (meterRafId === null && typeof requestAnimationFrame !== 'undefined') {
+    lastMeterTime = typeof performance !== 'undefined' ? performance.now() : 0;
+    meterRafId = requestAnimationFrame(updateMeterLoop);
+  }
 }
 
 export async function initAudio() {
   if (isAudioInitialized) return;
 
-  await Tone.start();
+  // Ensure Tone AudioContext is running
+  if (Tone.getContext().state !== 'running') {
+    await Tone.start();
+    if (Tone.getContext().state !== 'running') {
+      await Tone.getContext().resume();
+    }
+  }
+  Tone.getTransport().start();
+  audioReady = true;
+
+  console.log('[audio] state', Tone.getContext().state);
 
   // Cancel any existing transport schedules (e.g. across HMR)
   Tone.getTransport().cancel();
-  Tone.getTransport().stop();
   Tone.getTransport().position = 0;
 
   // Signal chain:
@@ -288,7 +437,7 @@ export async function initAudio() {
   // pad & subRoot -> filter -> reverb -> masterGain -> Destination & meter
   filter = new Tone.Filter({
     type: 'lowpass',
-    frequency: 6000 * Math.pow(500 / 6000, currentAudioAge),
+    frequency: isEnding ? 1800 : 6000 * Math.pow(500 / 6000, currentAudioAge),
     rolloff: -12,
     Q: 1
   });
@@ -304,7 +453,7 @@ export async function initAudio() {
   reverb = new Tone.Reverb({
     decay: 3.5,
     preDelay: 0.01,
-    wet: 0.15 + 0.50 * currentAudioAge
+    wet: isEnding ? 0.75 : (0.15 + 0.50 * currentAudioAge)
   });
   await reverb.ready;
 
@@ -352,7 +501,7 @@ export async function initAudio() {
     volume: -6
   });
   musicBox.maxPolyphony = 6;
-  musicBox.set({ detune: 20 * currentAudioAge });
+  musicBox.set({ detune: isEnding ? 0 : 20 * currentAudioAge });
   musicBox.connect(tapPanner);
 
   // 2. PAD: PolySynth with triangle oscillators (attack 1.5, release 3), about 10 dB below the melody
@@ -364,7 +513,7 @@ export async function initAudio() {
       sustain: 1.0,
       release: 3.0
     },
-    volume: -16 + 8 * currentAudioAge
+    volume: isEnding ? -60 : (-16 + 8 * currentAudioAge)
   });
   pad.maxPolyphony = 16;
   pad.connect(filter);
@@ -378,7 +527,7 @@ export async function initAudio() {
       sustain: 1.0,
       release: 3.0
     },
-    volume: -26 + 6 * currentAudioAge
+    volume: isEnding ? -60 : (-26 + 6 * currentAudioAge)
   });
   subRoot.connect(filter);
 
@@ -390,9 +539,11 @@ export async function initAudio() {
 
   sequence = new Tone.Sequence(
     (time, step) => {
+      const fadeMult = getMainFadeMult();
+
       // Pad chord cycle: one chord per 4 steps (steps 0, 4, 8, 12)
       const chord = CHORDS.find((c) => c.step === step);
-      if (chord) {
+      if (chord && fadeMult > 0.05) {
         const adjustedNotes = chord.notes.map((n) => getAdjustedFrequency(n, currentMinorMix));
         const adjustedRoot = getAdjustedFrequency(chord.root, currentMinorMix);
         pad.triggerAttackRelease(adjustedNotes, '1m', time);
@@ -401,12 +552,14 @@ export async function initAudio() {
 
       // Melody step (center melody in stereo field)
       const note = MOTIF[step];
-      if (note !== null && currentDensity >= STEP_MIN_DENSITY[step]) {
+      const effectiveDensity = currentDensity * fadeMult;
+      if (note !== null && effectiveDensity >= STEP_MIN_DENSITY[step]) {
         if (tapPanner) {
           tapPanner.pan.setValueAtTime(0, time);
         }
         const freq = getAdjustedFrequency(note, currentMinorMix);
-        triggerMusicBoxNote(freq, '4n', time);
+        const vel = Math.max(0.1, fadeMult);
+        triggerMusicBoxNote(freq, '4n', time, vel);
       }
     },
     stepIndices,
@@ -414,8 +567,48 @@ export async function initAudio() {
   );
   sequence.loop = true;
 
+  // 4. Ending MOTIF sequence:
+  // Sparse (every other non-null note: C5, G5, G5, D5, C5, A4) at half tempo ('2n'), plain C major, velocity 0.5, long gaps
+  endingSequence = new Tone.Sequence(
+    (time, note) => {
+      if (note && isEnding) {
+        if (tapPanner) {
+          tapPanner.pan.setValueAtTime(0, time);
+        }
+        // Plain C major, bypass minorMix
+        const freq = Tone.Frequency(note).toFrequency();
+        triggerMusicBoxNote(freq, '2n', time, 0.5);
+
+        // Notify visual pulse on chest
+        const delayMs = Math.max(0, (time - Tone.now()) * 1000);
+        setTimeout(() => {
+          if (isEnding) {
+            notifyEndingNote();
+          }
+        }, delayMs);
+      }
+    },
+    [
+      'C5', null,
+      'G5', null,
+      'G5', null,
+      'D5', null,
+      'C5', null,
+      'A4', null,
+      null, null,
+      null, null
+    ],
+    '2n'
+  );
+  endingSequence.loop = true;
+
   Tone.getTransport().start();
   sequence.start(0);
 
+  if (isEnding) {
+    endingSequence.start('+1.0');
+  }
+
   isAudioInitialized = true;
+  startMeterLoop();
 }

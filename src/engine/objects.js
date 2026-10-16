@@ -1,6 +1,8 @@
 import Matter from 'matter-js';
 import { getPalette } from './palette.js';
 import { playSfx } from './sfx.js';
+import { createLabelsManager } from './labels.js';
+import { getLevel } from './audio.js';
 
 const { Engine, Bodies, Body, Composite } = Matter;
 
@@ -379,6 +381,11 @@ function easeOutCubic(t) {
   return 1 - Math.pow(1 - t, 3);
 }
 
+const SPRING_K = 170;
+const SPRING_C = 11;
+const FIXED_STEP = 1 / 60;
+const FIXED_STEP_MS = 1000 / 60;
+
 export function createObjectsEngine(canvas, initialWidth, initialHeight) {
   const ctx = canvas.getContext('2d');
   const paths = getPaths();
@@ -388,10 +395,18 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
   let dpr = Math.min(window.devicePixelRatio || 1, 1.5);
 
   const engine = Engine.create({
-    gravity: { x: 0, y: -0.25, scale: 0.001 }
+    gravity: { x: 0, y: -0.25, scale: 0.001 },
+    enableSleeping: true
   });
 
+  const labelsManager = createLabelsManager(engine, canvas, initialWidth, initialHeight);
+
   const bodies = [];
+  const ripples = [];
+  const activeWordBodies = new Set();
+  let activeClickedBody = null;
+  let physicsAccumulator = 0;
+
   let pendingSpawns = [];
   let collisionsActive = false;
   let currentGravityY = -0.25;
@@ -403,7 +418,6 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
 
   let lastActiveStage = null;
   const scratchForce = { x: 0, y: 0 };
-  const scratchImpulse = { x: 0, y: 0 };
 
   // Pointer & hover label tracking
   let pointerX = -9999;
@@ -419,6 +433,11 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
     }
     bodies.length = 0;
     pendingSpawns.length = 0;
+    ripples.length = 0;
+    activeWordBodies.clear();
+    activeClickedBody = null;
+    physicsAccumulator = 0;
+
     if (floorBody) {
       Composite.remove(engine.world, [floorBody, leftWall, rightWall]);
       floorBody = null;
@@ -429,8 +448,273 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
     labelAlpha = 0;
   }
 
+  function addRipple(x, y, baseRadius) {
+    ripples.push({
+      x,
+      y,
+      baseRadius: Math.max(16, baseRadius),
+      elapsed: 0,
+      duration: 0.600
+    });
+  }
+
+  function updateAndRenderRipples(targetCtx, dt, pColor, targetDpr) {
+    if (ripples.length === 0) return;
+    targetCtx.save();
+    targetCtx.setTransform(targetDpr, 0, 0, targetDpr, 0, 0);
+    targetCtx.lineWidth = 1.5;
+
+    for (let i = ripples.length - 1; i >= 0; i--) {
+      const r = ripples[i];
+      r.elapsed += dt;
+      if (r.elapsed >= r.duration) {
+        ripples.splice(i, 1);
+        continue;
+      }
+      const p = Math.min(1.0, r.elapsed / r.duration);
+      const e = easeOutCubic(p);
+      const currentRadius = r.baseRadius * (1.0 + 0.6 * e);
+      const alpha = Math.max(0, 0.5 * (1.0 - e));
+
+      targetCtx.strokeStyle = `rgba(${pColor.r}, ${pColor.g}, ${pColor.b}, ${alpha.toFixed(3)})`;
+      targetCtx.beginPath();
+      targetCtx.arc(r.x, r.y, currentRadius, 0, Math.PI * 2);
+      targetCtx.stroke();
+    }
+    targetCtx.restore();
+  }
+
+  function updateSpring(plugin, dt, isHovered) {
+    plugin.targetScale = isHovered ? 1.06 : 1.00;
+
+    if (plugin.springScale === undefined) plugin.springScale = 1.0;
+    if (plugin.springScaleVel === undefined) plugin.springScaleVel = 0;
+    if (plugin.springRot === undefined) plugin.springRot = 0;
+    if (plugin.springRotVel === undefined) plugin.springRotVel = 0;
+
+    // Scale spring: F = -k*(x - target) - c*v
+    const fScale = -SPRING_K * (plugin.springScale - plugin.targetScale) - SPRING_C * plugin.springScaleVel;
+    plugin.springScaleVel += fScale * dt;
+    plugin.springScale += plugin.springScaleVel * dt;
+    plugin.springScale = Math.max(0.85, Math.min(1.25, plugin.springScale));
+
+    // Rotation spring: target rotation is 0
+    const fRot = -SPRING_K * plugin.springRot - SPRING_C * plugin.springRotVel;
+    plugin.springRotVel += fRot * dt;
+    plugin.springRot += plugin.springRotVel * dt;
+    const maxRotRad = (16 * Math.PI) / 180;
+    plugin.springRot = Math.max(-maxRotRad, Math.min(maxRotRad, plugin.springRot));
+
+    // Sync to wordObj if word body
+    if (plugin.isWord && plugin.wordObj) {
+      plugin.wordObj.wobbleScale = plugin.springScale - 1.0;
+      plugin.wordObj.wobbleRot = plugin.springRot;
+      plugin.wordObj.wobbleActive = false;
+    }
+  }
+
+  function updateTetherResponse(body, dt) {
+    const tr = body.plugin.tetherResponse;
+    const baseFriction = body.plugin.baseFrictionAir !== undefined ? body.plugin.baseFrictionAir : body.frictionAir;
+
+    if (!tr) {
+      body.frictionAir = baseFriction;
+      return 1.0;
+    }
+
+    tr.elapsed += dt;
+    const totalDuration = tr.holdDuration + tr.rampDuration;
+
+    let mult = 1.0;
+    if (tr.elapsed <= tr.holdDuration) {
+      mult = 0.30;
+    } else if (tr.elapsed < totalDuration) {
+      const u = (tr.elapsed - tr.holdDuration) / tr.rampDuration;
+      mult = 0.30 + 0.70 * easeOutCubic(u);
+    } else {
+      mult = 1.0;
+      body.plugin.tetherResponse = null;
+    }
+
+    // Air friction bump during settle (0.35s to 1.40s)
+    if (tr.elapsed >= 0.35 && tr.elapsed <= totalDuration) {
+      const s = (tr.elapsed - 0.35) / (totalDuration - 0.35);
+      body.frictionAir = baseFriction + 0.035 * Math.sin(s * Math.PI);
+    } else {
+      body.frictionAir = baseFriction;
+    }
+
+    return mult;
+  }
+
+  function applyActivePush(body, stepDt) {
+    const push = body.plugin.activePush;
+    if (!push) return;
+
+    const prevP = Math.min(1.0, push.elapsed / push.duration);
+    push.elapsed += stepDt;
+    const nextP = Math.min(1.0, push.elapsed / push.duration);
+
+    // Force profile: integral of 3*(1 - p)^2 dp over [prevP, nextP]
+    const weight = Math.pow(1 - prevP, 3) - Math.pow(1 - nextP, 3);
+    const impulse = push.totalImpulse * weight;
+
+    if (impulse > 0) {
+      scratchForce.x = push.dirX * impulse;
+      scratchForce.y = push.dirY * impulse;
+      Body.applyForce(body, body.position, scratchForce);
+    }
+
+    if (push.elapsed >= push.duration) {
+      body.plugin.activePush = null;
+      if (activeClickedBody === body) {
+        activeClickedBody = null;
+      }
+    }
+  }
+
+  function applyEdgeCushion(body, screenWidth, screenHeight) {
+    const r = body.plugin.drawnRadius || 40;
+    const pos = body.position;
+    const vel = body.velocity;
+    const mass = body.mass;
+    const kEdge = 0.0006 * mass;
+    const dEdge = 0.0025 * mass;
+
+    let fx = 0;
+    let fy = 0;
+
+    // Left boundary
+    if (pos.x < r) {
+      const dist = r - pos.x;
+      fx += kEdge * dist - dEdge * vel.x;
+    }
+    // Right boundary
+    if (pos.x > screenWidth - r) {
+      const dist = screenWidth - r - pos.x;
+      fx += -kEdge * dist - dEdge * vel.x;
+    }
+    // Top boundary
+    if (pos.y < r) {
+      const dist = r - pos.y;
+      fy += kEdge * dist - dEdge * vel.y;
+    }
+    // Bottom boundary (only when floating, not adult pile)
+    if (pos.y > screenHeight - r && (!floorBody || body.plugin.stage !== 'adult')) {
+      const dist = screenHeight - r - pos.y;
+      fy += -kEdge * dist - dEdge * vel.y;
+    }
+
+    if (fx !== 0 || fy !== 0) {
+      scratchForce.x = fx;
+      scratchForce.y = fy;
+      Body.applyForce(body, pos, scratchForce);
+    }
+  }
+
+  function applyClickInteraction(body, px, py, isWord) {
+    if (!body || !body.plugin) return;
+    const plugin = body.plugin;
+    const now = performance.now();
+    const isRapidClick = (now - (plugin.lastClickTime || 0)) < 300;
+    plugin.lastClickTime = now;
+
+    // 1. Wake sleeping body
+    if (body.isSleeping) {
+      Matter.Sleeping.set(body, false);
+    }
+    if (plugin.stage === 'adult') {
+      activeClickedBody = body;
+    }
+
+    // 2. Compute push direction away from click point
+    const dx = body.position.x - px;
+    const dy = body.position.y - py;
+    const dist = Math.hypot(dx, dy);
+    let dirX = 0;
+    let dirY = -1;
+    if (dist > 1) {
+      dirX = dx / dist;
+      dirY = dy / dist;
+    } else {
+      dirX = body.position.x > width / 2 ? 0.35 : -0.35;
+      dirY = -0.93;
+      const len = Math.hypot(dirX, dirY);
+      dirX /= len;
+      dirY /= len;
+    }
+
+    // Rotation direction: kicking away from click side
+    const rotDir = (px <= body.position.x) ? 1 : -1;
+
+    // 3. Magnitude: adult pile objects get ~half strength
+    const scaleFactor = plugin.sizeScale || 1.0;
+    let baseImpulse = 0.012;
+    if (plugin.stage === 'adult') {
+      baseImpulse = 0.006; // half strength so pile does not explode
+    } else if (isWord) {
+      baseImpulse = 0.007;
+    }
+    const totalImpulse = baseImpulse * scaleFactor * body.mass;
+    const maxSafeSpeed = plugin.stage === 'adult' ? 2.0 : 4.5;
+    plugin.maxSafeSpeed = maxSafeSpeed;
+
+    // 4. Eased push (180 ms)
+    if (isRapidClick && plugin.activePush) {
+      plugin.activePush.dirX = (plugin.activePush.dirX + dirX) * 0.5;
+      plugin.activePush.dirY = (plugin.activePush.dirY + dirY) * 0.5;
+      const dlen = Math.hypot(plugin.activePush.dirX, plugin.activePush.dirY) || 1;
+      plugin.activePush.dirX /= dlen;
+      plugin.activePush.dirY /= dlen;
+      plugin.activePush.totalImpulse = Math.min(totalImpulse * 1.5, plugin.activePush.totalImpulse + totalImpulse * 0.6);
+      plugin.activePush.elapsed = 0;
+      plugin.activePush.duration = 0.180;
+    } else {
+      plugin.activePush = {
+        dirX,
+        dirY,
+        totalImpulse,
+        elapsed: 0,
+        duration: 0.180,
+        maxSpeed: maxSafeSpeed
+      };
+    }
+
+    // 5. Soft tether response (700ms hold at 30%, 700ms ramp with easeOutCubic)
+    if (plugin.hx !== undefined || isWord) {
+      plugin.tetherResponse = {
+        elapsed: 0,
+        holdDuration: 0.700,
+        rampDuration: 0.700
+      };
+    }
+
+    // 6. Spring feedback: scale punches to ~1.12 with one overshoot, rotation kicks 6 to 9 deg
+    if (plugin.springScale === undefined) plugin.springScale = 1.0;
+    if (plugin.springScaleVel === undefined) plugin.springScaleVel = 0;
+    if (plugin.springRot === undefined) plugin.springRot = 0;
+    if (plugin.springRotVel === undefined) plugin.springRotVel = 0;
+
+    if (isRapidClick) {
+      plugin.springScaleVel = Math.min(5.5, plugin.springScaleVel + 2.2);
+      plugin.springRotVel = Math.max(-6.5, Math.min(6.5, plugin.springRotVel + rotDir * 2.5));
+    } else {
+      plugin.springScaleVel = 3.15; // punches to ~1.12 with one small overshoot
+      plugin.springRotVel = rotDir * 3.5; // kicks ~7.6 deg and settles
+    }
+
+    // 7. Thin expanding ripple
+    addRipple(body.position.x, body.position.y, plugin.drawnRadius || 40);
+
+    // 8. Track word body if applicable
+    if (isWord) {
+      activeWordBodies.add(body);
+    }
+  }
+
   function updateBoundaries(tether) {
-    const needBoundaries = currentGravityY > 0.05 && tether < 0.3;
+    const hasShatteredWords = labelsManager && typeof labelsManager.hasShatteredWords === 'function' && labelsManager.hasShatteredWords();
+    const needBoundaries = (currentGravityY > 0.05 && tether < 0.3) || hasShatteredWords;
 
     if (needBoundaries) {
       const boundaryFilter = {
@@ -501,12 +785,10 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
     let spawnY;
 
     if (stage === 'adult') {
-      // Drop across viewport away from the central 30% of screen width ([0.35*w, 0.65*w])
       const dropSlots = [0.15, 0.23, 0.31, 0.69, 0.77, 0.85];
       spawnX = dropSlots[i] * width + (Math.random() - 0.5) * 0.03 * width;
       spawnY = -spec.height * sizeScale - 30 - (i % 3) * 40;
 
-      // Pick spawn point at least one object radius away from every live body
       const reqRadius = spec.hitRadius * sizeScale;
       for (let k = 0; k < bodies.length; k++) {
         const ob = bodies[k];
@@ -542,23 +824,32 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
         scale: spec.pathScale * sizeScale,
         alpha,
         drawnRadius: spec.hitRadius * sizeScale,
-        wobbleActive: false,
-        wobbleTime: 0,
-        wobbleDir: 1,
-        wobbleScale: 0,
-        wobbleRot: 0,
         fadeAlpha: 0.0,
         animScale: 0.85,
         fadeInElapsed: 0,
         fadeOutElapsed: 0,
         fadingOut: false,
-        swayPhase: Math.random() * Math.PI * 2
+        swayPhase: Math.random() * Math.PI * 2,
+        springScale: 1.0,
+        springScaleVel: 0,
+        springRot: 0,
+        springRotVel: 0,
+        targetScale: 1.0,
+        activePush: null,
+        tetherResponse: null,
+        baseFrictionAir: bodyOpts.frictionAir,
+        maxSafeSpeed: 2.0,
+        lastClickTime: 0,
+        prevX: spawnX,
+        prevY: spawnY,
+        prevAngle: body.angle,
+        prevVelX: 0,
+        prevVelY: 0
       };
 
       bodies.push(body);
       Composite.add(engine.world, body);
     } else {
-      // 6 distinct screen slots (3 left, 3 right, spaced vertically)
       let hx;
       let hy;
       switch (i) {
@@ -600,7 +891,6 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
       spawnX = targetX;
       spawnY = targetY;
 
-      // Pick spawn point at least one object radius away from every live body
       const reqRadius = spec.hitRadius * sizeScale;
       for (let k = 0; k < bodies.length; k++) {
         const ob = bodies[k];
@@ -635,11 +925,6 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
         scale: spec.pathScale * sizeScale,
         alpha,
         drawnRadius: spec.hitRadius * sizeScale,
-        wobbleActive: false,
-        wobbleTime: 0,
-        wobbleDir: 1,
-        wobbleScale: 0,
-        wobbleRot: 0,
         fadeAlpha: 0.0,
         animScale: 0.85,
         fadeInElapsed: 0,
@@ -651,7 +936,22 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
         ry,
         orbitSpeed,
         phase,
-        swayPhase: Math.random() * Math.PI * 2
+        swayPhase: Math.random() * Math.PI * 2,
+        springScale: 1.0,
+        springScaleVel: 0,
+        springRot: 0,
+        springRotVel: 0,
+        targetScale: 1.0,
+        activePush: null,
+        tetherResponse: null,
+        baseFrictionAir: bodyOpts.frictionAir,
+        maxSafeSpeed: 4.5,
+        lastClickTime: 0,
+        prevX: spawnX,
+        prevY: spawnY,
+        prevAngle: body.angle,
+        prevVelX: 0,
+        prevVelY: 0
       };
 
       bodies.push(body);
@@ -660,7 +960,6 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
   }
 
   function startStageTransition(newStage, isFirst = false) {
-    // 1. Outgoing bodies become non-colliding and fade out over 1.4s
     for (let i = 0; i < bodies.length; i++) {
       const b = bodies[i];
       if (b.plugin.stage !== newStage) {
@@ -673,7 +972,6 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
         b.collisionFilter.mask = CAT_NONE;
         b.collisionFilter.group = -1;
       } else {
-        // Reversing scroll: body of newStage was fading out, reverse it smoothly!
         if (b.plugin.fadingOut) {
           b.plugin.fadingOut = false;
           const currentFade = b.plugin.fadeAlpha || 0.0;
@@ -682,10 +980,8 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
       }
     }
 
-    // 2. Discard pending spawns of any other stage
     pendingSpawns = pendingSpawns.filter((p) => p.stage === newStage);
 
-    // 3. Incoming objects start 40% into outgoing fade (1.4 * 0.40 = 0.56s), staggered by 200ms each
     for (let slot = 0; slot < 6; slot++) {
       const existing = bodies.some((b) => b.plugin.stage === newStage && b.plugin.slotIndex === slot);
       const alreadyPending = pendingSpawns.some((p) => p.stage === newStage && p.slotIndex === slot);
@@ -703,6 +999,7 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
     width = newW;
     height = newH;
     dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    labelsManager.resize(newW, newH);
   }
 
   function setPointer(x, y) {
@@ -710,14 +1007,17 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
     pointerY = y;
   }
 
-  // Hit test finds topmost object (highest z, drawn last) containing pointer
   function hitTest(px, py) {
+    // 1. Check fallen words
+    const wordHit = labelsManager.hitTestWord(px, py);
+    if (wordHit) return wordHit;
+
+    // 2. Check floating objects
     let topHit = null;
     let topZ = -Infinity;
     for (let i = 0; i < bodies.length; i++) {
       const b = bodies[i];
       const totalAlpha = b.plugin.alpha * Math.max(0, Math.min(1, b.plugin.fadeAlpha));
-      // Ignore objects whose alpha is below 0.3 (fading out)
       if (totalAlpha < 0.3) continue;
 
       const r = b.plugin.drawnRadius;
@@ -737,22 +1037,12 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
     const hit = hitTest(px, py);
     if (!hit) return null;
 
-    // Upward-or-sideways impulse on the body (small, scaled by size)
-    const scaleFactor = hit.plugin.sizeScale || 1;
-    scratchImpulse.x = (Math.random() - 0.5) * 0.006 * scaleFactor * hit.mass;
-    scratchImpulse.y = -0.012 * scaleFactor * hit.mass;
-    Body.applyForce(hit, hit.position, scratchImpulse);
-    Body.setAngularVelocity(hit, hit.angularVelocity + (Math.random() - 0.5) * 0.06);
+    const isWord = Boolean(hit.plugin && hit.plugin.isWord);
+    applyClickInteraction(hit, px, py, isWord);
 
-    // Wobble: kicks drawn scale by 12% and rotation by 8 deg, decaying in 0.5s
-    hit.plugin.wobbleActive = true;
-    hit.plugin.wobbleTime = 0;
-    hit.plugin.wobbleDir = Math.random() < 0.5 ? 1 : -1;
-    hit.plugin.wobbleScale = 0.12;
-    hit.plugin.wobbleRot = hit.plugin.wobbleDir * (8 * Math.PI / 180);
-
-    // Play that object's sound via sfx.js
-    playSfx(hit.plugin.type, lastAge);
+    if (!isWord) {
+      playSfx(hit.plugin.type, lastAge);
+    }
 
     return hit;
   }
@@ -773,10 +1063,11 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
 
     const tether = getTether(currentAge);
     const timeSec = time * 0.001;
+    const frameDt = Math.min(dt, 0.050);
 
     // 1. Target gravity & boundaries
     const targetGravityY = getTargetGravityY(currentAge);
-    currentGravityY += (targetGravityY - currentGravityY) * Math.min(1, dt * 6);
+    currentGravityY += (targetGravityY - currentGravityY) * Math.min(1, frameDt * 6);
     engine.gravity.y = currentGravityY;
     engine.gravity.x = 0;
 
@@ -793,7 +1084,7 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
     // 3. Process pending staggered spawns
     for (let i = pendingSpawns.length - 1; i >= 0; i--) {
       const ps = pendingSpawns[i];
-      ps.delay -= dt;
+      ps.delay -= frameDt;
       if (ps.delay <= 0) {
         spawnSingleBody(ps.stage, ps.slotIndex, timeSec);
         pendingSpawns.splice(i, 1);
@@ -804,11 +1095,11 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
     for (let i = bodies.length - 1; i >= 0; i--) {
       const b = bodies[i];
       if (b.plugin.fadingOut) {
-        b.plugin.fadeOutElapsed += dt;
+        b.plugin.fadeOutElapsed += frameDt;
         const p = Math.min(1.0, b.plugin.fadeOutElapsed / 1.4);
         const e = easeInOutCubic(p);
         b.plugin.fadeAlpha = Math.max(0.0, 1.0 - e);
-        b.plugin.animScale = 1.0 - 0.10 * e; // scale to 0.9
+        b.plugin.animScale = 1.0 - 0.10 * e;
         if (p >= 1.0) {
           if (currentLabelBody === b) {
             currentLabelBody = null;
@@ -819,20 +1110,18 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
           continue;
         }
       } else if (b.plugin.fadeInElapsed < 1.0) {
-        b.plugin.fadeInElapsed += dt;
+        b.plugin.fadeInElapsed += frameDt;
         const p = Math.min(1.0, b.plugin.fadeInElapsed / 1.0);
         const e = easeOutCubic(p);
         b.plugin.fadeAlpha = e;
-        b.plugin.animScale = 0.85 + 0.15 * e; // scale 0.85 to 1.0
+        b.plugin.animScale = 0.85 + 0.15 * e;
       } else {
         b.plugin.fadeAlpha = 1.0;
         b.plugin.animScale = 1.0;
       }
     }
 
-    // 5. Collision filtering:
-    // Disabled while tether > 0.3 (orbiting pass-through).
-    // Enabled as tether drops below 0.3 with hysteresis band (0.28 / 0.32), only between same stage group.
+    // 5. Collision filtering
     if (collisionsActive) {
       if (tether > 0.32) collisionsActive = false;
     } else {
@@ -857,9 +1146,9 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
       }
     }
 
-    // 6. Between 0.5 and 0.75 (tether releasing), apply velocity damping so objects ease into falling
+    // 6. Between 0.5 and 0.75 (tether releasing), apply velocity damping
     if (currentAge >= 0.5 && currentAge <= 0.75) {
-      const damp = Math.pow(0.97, dt * 60);
+      const damp = Math.pow(0.97, frameDt * 60);
       for (let i = 0; i < bodies.length; i++) {
         const b = bodies[i];
         Body.setVelocity(b, {
@@ -870,57 +1159,148 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
       }
     }
 
-    // 7. Apply orbit spring forces to tethered bodies & decay wobbles
-    for (let i = 0; i < bodies.length; i++) {
-      const b = bodies[i];
-      const plugin = b.plugin;
-
-      // Decay wobble spring over 0.5s
-      if (plugin.wobbleActive) {
-        plugin.wobbleTime += dt;
-        if (plugin.wobbleTime >= 0.5) {
-          plugin.wobbleActive = false;
-          plugin.wobbleScale = 0;
-          plugin.wobbleRot = 0;
-        } else {
-          const env = Math.exp(-plugin.wobbleTime * 6);
-          plugin.wobbleScale = 0.12 * Math.cos(plugin.wobbleTime * 25) * env;
-          plugin.wobbleRot = plugin.wobbleDir * (8 * Math.PI / 180) * Math.sin(plugin.wobbleTime * 25) * env;
-        }
-      }
-
-      if (plugin.hx !== undefined && tether > 0.001) {
-        const targetX = plugin.hx + Math.cos(timeSec * plugin.orbitSpeed + plugin.phase) * plugin.rx;
-        const targetY = plugin.hy + Math.sin(timeSec * plugin.orbitSpeed * 0.8 + plugin.phase) * plugin.ry;
-
-        const dx = targetX - b.position.x;
-        const dy = targetY - b.position.y;
-
-        const k = 0.00035 * b.mass;
-        const damping = 0.0025 * b.mass;
-
-        scratchForce.x = (k * dx - damping * b.velocity.x) * tether;
-        scratchForce.y = (k * dy - damping * b.velocity.y) * tether;
-
-        Body.applyForce(b, b.position, scratchForce);
-      }
-    }
-
-    // 8. Step physics
-    const subDt = Math.min(dt * 1000, 16.667);
-    Engine.update(engine, subDt);
-
-    // 9. Hit-testing throttled to once per animation frame
+    // 7. Hit-testing throttled to once per animation frame
     const hovered = hitTest(pointerX, pointerY);
-    if (hovered) {
+    if (hovered && !hovered.plugin.isWord) {
       currentLabelBody = hovered;
-      labelAlpha = Math.min(1.0, labelAlpha + dt / 0.150);
+      labelAlpha = Math.min(1.0, labelAlpha + frameDt / 0.150);
     } else {
-      labelAlpha = Math.max(0.0, labelAlpha - dt / 0.150);
+      labelAlpha = Math.max(0.0, labelAlpha - frameDt / 0.150);
       if (labelAlpha <= 0) {
         currentLabelBody = null;
       }
     }
+
+    // 8. Update damped springs for all objects and active words
+    for (let i = 0; i < bodies.length; i++) {
+      const b = bodies[i];
+      updateSpring(b.plugin, frameDt, b === hovered);
+    }
+    if (hovered && hovered.plugin && hovered.plugin.isWord) {
+      activeWordBodies.add(hovered);
+    }
+    activeWordBodies.forEach((wb) => {
+      if (!wb || !wb.plugin) {
+        activeWordBodies.delete(wb);
+        return;
+      }
+      updateSpring(wb.plugin, frameDt, wb === hovered);
+      if (wb !== hovered &&
+          Math.abs((wb.plugin.springScale || 1.0) - 1.0) < 0.001 &&
+          Math.abs(wb.plugin.springRot || 0) < 0.001 &&
+          !wb.plugin.activePush &&
+          !wb.plugin.tetherResponse) {
+        activeWordBodies.delete(wb);
+      }
+    });
+
+    // 9. Fixed timestep physics update with accumulator
+    physicsAccumulator += frameDt;
+    let stepsTaken = 0;
+
+    while (physicsAccumulator >= FIXED_STEP && stepsTaken < 3) {
+      // Record previous states for render interpolation
+      for (let i = 0; i < bodies.length; i++) {
+        const b = bodies[i];
+        b.plugin.prevX = b.position.x;
+        b.plugin.prevY = b.position.y;
+        b.plugin.prevAngle = b.angle;
+      }
+      activeWordBodies.forEach((wb) => {
+        wb.plugin.prevX = wb.position.x;
+        wb.plugin.prevY = wb.position.y;
+        wb.plugin.prevAngle = wb.angle;
+      });
+
+      // a. Active push forces
+      for (let i = 0; i < bodies.length; i++) {
+        applyActivePush(bodies[i], FIXED_STEP);
+      }
+      activeWordBodies.forEach((wb) => {
+        applyActivePush(wb, FIXED_STEP);
+      });
+
+      // b. Tether response & orbit forces
+      for (let i = 0; i < bodies.length; i++) {
+        const b = bodies[i];
+        const plugin = b.plugin;
+        const tetherMult = updateTetherResponse(b, FIXED_STEP);
+
+        if (plugin.hx !== undefined && tether > 0.001) {
+          const targetX = plugin.hx + Math.cos(timeSec * plugin.orbitSpeed + plugin.phase) * plugin.rx;
+          const targetY = plugin.hy + Math.sin(timeSec * plugin.orbitSpeed * 0.8 + plugin.phase) * plugin.ry;
+
+          const dx = targetX - b.position.x;
+          const dy = targetY - b.position.y;
+
+          const k = 0.00035 * b.mass;
+          const damping = 0.0025 * b.mass;
+
+          const effectiveTether = tether * tetherMult;
+          scratchForce.x = (k * dx - damping * b.velocity.x) * effectiveTether;
+          scratchForce.y = (k * dy - damping * b.velocity.y) * effectiveTether;
+
+          Body.applyForce(b, b.position, scratchForce);
+        }
+
+        applyEdgeCushion(b, width, height);
+      }
+      activeWordBodies.forEach((wb) => {
+        applyEdgeCushion(wb, width, height);
+      });
+
+      // c. Record adult pile velocities before step
+      for (let i = 0; i < bodies.length; i++) {
+        const b = bodies[i];
+        if (b.plugin.stage === 'adult') {
+          b.plugin.prevVelX = b.velocity.x;
+          b.plugin.prevVelY = b.velocity.y;
+        }
+      }
+
+      // d. Step physics
+      Engine.update(engine, FIXED_STEP_MS);
+
+      // e. Speed clamping and pile safety
+      for (let i = 0; i < bodies.length; i++) {
+        const b = bodies[i];
+        const sp = Math.hypot(b.velocity.x, b.velocity.y);
+        const maxSp = b.plugin.maxSafeSpeed || (b.plugin.stage === 'adult' ? 2.0 : 4.5);
+        if (sp > maxSp) {
+          const ratio = maxSp / sp;
+          Body.setVelocity(b, { x: b.velocity.x * ratio, y: b.velocity.y * ratio });
+        }
+
+        // Adult pile safety: keep sleeping bodies asleep and cap contact impulse on neighbours
+        if (b.plugin.stage === 'adult' && b !== activeClickedBody) {
+          if (b.isSleeping) {
+            Matter.Sleeping.set(b, true);
+            continue;
+          }
+          const dvx = b.velocity.x - (b.plugin.prevVelX || 0);
+          const dvy = b.velocity.y - (b.plugin.prevVelY || 0);
+          const dvMag = Math.hypot(dvx, dvy);
+          if (dvMag > 0.45) {
+            const sc = 0.45 / dvMag;
+            Body.setVelocity(b, {
+              x: (b.plugin.prevVelX || 0) + dvx * sc,
+              y: Math.max(-0.3, (b.plugin.prevVelY || 0) + dvy * sc)
+            });
+          } else if (b.velocity.y < -0.3) {
+            Body.setVelocity(b, { x: b.velocity.x, y: Math.max(-0.3, b.velocity.y) });
+          }
+        }
+      }
+
+      physicsAccumulator -= FIXED_STEP;
+      stepsTaken++;
+    }
+
+    if (physicsAccumulator > FIXED_STEP * 2) {
+      physicsAccumulator = 0;
+    }
+
+    const interpAlpha = Math.max(0, Math.min(1, physicsAccumulator / FIXED_STEP));
 
     // 10. Render objects to canvas (sorted by z, far first)
     ctx.clearRect(0, 0, width * dpr, height * dpr);
@@ -932,17 +1312,30 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
 
     for (let i = 0; i < bodies.length; i++) {
       const body = bodies[i];
-      const { type, scale, alpha, fadeAlpha, hx, swayPhase, wobbleScale, wobbleRot, animScale } = body.plugin;
+      const { type, scale, alpha, fadeAlpha, hx, swayPhase, animScale, prevX, prevY, prevAngle } = body.plugin;
       const totalAlpha = alpha * Math.max(0, Math.min(1, fadeAlpha));
       if (totalAlpha <= 0.005) continue;
 
       ctx.globalAlpha = totalAlpha;
 
+      const renderX = prevX !== undefined ? prevX + (body.position.x - prevX) * interpAlpha : body.position.x;
+      const renderY = prevY !== undefined ? prevY + (body.position.y - prevY) * interpAlpha : body.position.y;
+
+      let diffAngle = body.angle - (prevAngle !== undefined ? prevAngle : body.angle);
+      while (diffAngle > Math.PI) diffAngle -= Math.PI * 2;
+      while (diffAngle < -Math.PI) diffAngle += Math.PI * 2;
+      const renderAngle = (prevAngle !== undefined ? prevAngle : body.angle) + diffAngle * interpAlpha;
+
       const swayRot = hx !== undefined
         ? Math.sin(timeSec * 1.2 + swayPhase) * 0.18 * tether
         : 0;
-      const totalAngle = body.angle + swayRot + (wobbleRot || 0);
-      const effectiveScale = scale * (1 + (wobbleScale || 0)) * (animScale || 1.0);
+      const totalAngle = renderAngle + swayRot + (body.plugin.springRot || 0);
+
+      const level = getLevel();
+      const objPhase = i * 0.85;
+      const wave = 0.65 + 0.35 * Math.cos(timeSec * 7.5 + objPhase);
+      const pulse = 1 + 0.04 * level * wave;
+      const effectiveScale = scale * (body.plugin.springScale || 1.0) * (animScale || 1.0) * pulse;
 
       const cos = Math.cos(totalAngle);
       const sin = Math.sin(totalAngle);
@@ -952,8 +1345,8 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
         sin * effectiveScale * dpr,
         -sin * effectiveScale * dpr,
         cos * effectiveScale * dpr,
-        body.position.x * dpr,
-        body.position.y * dpr
+        renderX * dpr,
+        renderY * dpr
       );
 
       const path = paths[type];
@@ -962,7 +1355,10 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
       }
     }
 
-    // 11. Render hover label
+    // 11. Render thin expanding ripples
+    updateAndRenderRipples(ctx, frameDt, getParticleColor(currentAge), dpr);
+
+    // 12. Render hover label
     if (currentLabelBody && labelAlpha > 0.01) {
       const text = LABELS[currentLabelBody.plugin.type];
       if (text) {
@@ -973,8 +1369,12 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
         const textMetrics = ctx.measureText(text);
         const textWidth = textMetrics.width;
 
-        const bx = currentLabelBody.position.x;
-        const by = currentLabelBody.position.y;
+        const bx = currentLabelBody.plugin.prevX !== undefined
+          ? currentLabelBody.plugin.prevX + (currentLabelBody.position.x - currentLabelBody.plugin.prevX) * interpAlpha
+          : currentLabelBody.position.x;
+        const by = currentLabelBody.plugin.prevY !== undefined
+          ? currentLabelBody.plugin.prevY + (currentLabelBody.position.y - currentLabelBody.plugin.prevY) * interpAlpha
+          : currentLabelBody.position.y;
         const rad = currentLabelBody.plugin.drawnRadius;
         const gap = 0.6 * rad;
 
@@ -996,11 +1396,15 @@ export function createObjectsEngine(canvas, initialWidth, initialHeight) {
       }
     }
 
+    // 13. Render stage label words & update physics
+    labelsManager.updateAndRender(frameDt, currentAge, time, active, dpr);
+
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1;
   }
 
   function destroy() {
+    labelsManager.destroy();
     clearAllBodies();
     Engine.clear(engine);
   }
