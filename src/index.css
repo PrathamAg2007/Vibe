@@ -117,14 +117,27 @@
     --sidebar-ring: oklch(0.556 0 0);
 }
 
+:root {
+  --page-bg: transparent;
+  --particle-color: #FFEFD0;
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
-    }
+  }
   body {
-    @apply bg-background text-foreground;
-    }
+    background-color: transparent;
+    color: var(--particle-color);
+    margin: 0;
+    overflow: hidden;
+    user-select: none;
+  }
   html {
-    @apply font-sans;
-    }
+    background-color: var(--page-bg);
+  }
+}
+
+.gate-text * {
+  color: var(--particle-color) !important;
 }
