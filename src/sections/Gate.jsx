@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react';
-import * as Tone from 'tone';
+import { memo, useEffect, useState } from 'react';
+import { initAudio } from '../engine/audio.js';
 import { TextGenerateEffect } from '../components/library/text-generate-effect';
 
-export default function Gate({ onEnter }) {
+function Gate({ onEnter }) {
   const [showSubtitle, setShowSubtitle] = useState(false);
   const [isFading, setIsFading] = useState(false);
   const [isGone, setIsGone] = useState(false);
@@ -20,11 +20,11 @@ export default function Gate({ onEnter }) {
     if (isFading || isGone) return;
     setIsFading(true);
 
-    // Audio unlock stub
+    // Initialize procedural audio engine on user interaction
     try {
-      await Tone.start();
-    } catch {
-      // Stub only: no sounds in Block 2
+      await initAudio();
+    } catch (err) {
+      console.warn('Audio init failed:', err);
     }
 
     if (onEnter) {
@@ -77,3 +77,5 @@ export default function Gate({ onEnter }) {
     </div>
   );
 }
+
+export default memo(Gate);

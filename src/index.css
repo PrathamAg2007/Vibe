@@ -1,13 +1,23 @@
 @import 'tailwindcss';
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/geist";
+
+@font-face {
+  font-family: 'Syne';
+  src: url('/fonts/Syne-ExtraBold.woff2') format('woff2');
+  font-weight: 800;
+  font-style: normal;
+  font-display: block;
+}
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-    --font-heading: var(--font-sans);
-    --font-sans: 'Geist Variable', sans-serif;
+    --font-display: 'Syne', sans-serif;
+    --font-utility: 'IBM Plex Mono', monospace;
+    --font-heading: var(--font-display);
+    --font-sans: var(--font-utility);
+    --font-mono: var(--font-utility);
     --color-sidebar-ring: var(--sidebar-ring);
     --color-sidebar-border: var(--sidebar-border);
     --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -49,6 +59,8 @@
 }
 
 :root {
+    --font-display: "Syne", sans-serif;
+    --font-utility: "IBM Plex Mono", monospace;
     --background: oklch(1 0 0);
     --foreground: oklch(0.145 0 0);
     --card: oklch(1 0 0);
@@ -81,6 +93,8 @@
     --sidebar-accent-foreground: oklch(0.205 0 0);
     --sidebar-border: oklch(0.922 0 0);
     --sidebar-ring: oklch(0.708 0 0);
+    --page-bg: oklch(0.17 0.057 32);
+    --particle-color: oklch(0.88 0.038 22);
 }
 
 .dark {
@@ -117,27 +131,87 @@
     --sidebar-ring: oklch(0.556 0 0);
 }
 
-:root {
-  --page-bg: transparent;
-  --particle-color: #FFEFD0;
-}
-
 @layer base {
   * {
     @apply border-border outline-ring/50;
   }
   body {
-    background-color: transparent;
+    background-color: var(--page-bg);
     color: var(--particle-color);
+    font-family: var(--font-utility);
+    font-weight: 400;
     margin: 0;
-    overflow: hidden;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
     user-select: none;
   }
   html {
     background-color: var(--page-bg);
+    color: var(--particle-color);
+    font-family: var(--font-utility);
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
   }
+  ::-webkit-scrollbar {
+    display: none;
+    width: 0px;
+    height: 0px;
+  }
+}
+
+html.lenis, html.lenis body {
+  height: auto;
+}
+.lenis.lenis-smooth {
+  scroll-behavior: auto !important;
+}
+.lenis.lenis-smooth [data-lenis-prevent] {
+  overscroll-behavior: contain;
+}
+.lenis.lenis-stopped {
+  overflow: hidden;
+}
+
+canvas {
+  touch-action: none;
+}
+
+.gate-wrapper,
+.gate-wrapper * {
+  pointer-events: none;
 }
 
 .gate-text * {
   color: var(--particle-color) !important;
+}
+
+/* Display font: Gate big title text (weight 800, Syne ExtraBold) */
+.gate-text > div:first-child,
+.gate-text > div:first-child * {
+  font-family: var(--font-display) !important;
+  font-weight: 800 !important;
+}
+
+/* Utility font: Gate subtitle (weight 400, IBM Plex Mono) */
+.gate-text .font-mono,
+.gate-text .font-mono * {
+  font-family: var(--font-utility) !important;
+  font-weight: 400 !important;
+}
+
+/* Utility font: age counter, credits line, mute toggle (weight 400, IBM Plex Mono) */
+#age-counter,
+.age-counter {
+  font-family: var(--font-utility) !important;
+  font-weight: 400 !important;
+  font-variant-numeric: tabular-nums !important;
+}
+
+.font-mono {
+  font-family: var(--font-utility) !important;
+  font-weight: 400;
 }

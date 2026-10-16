@@ -10,6 +10,8 @@ export const age = {
 
 export function setAge(nextAge) {
   const clamped = Math.max(0, Math.min(1, Number(nextAge) || 0));
-  age.value = clamped;
+  if (age.value !== clamped) {
+    age.value = clamped;
+  }
   return clamped;
 }

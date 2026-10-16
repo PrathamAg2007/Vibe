@@ -1,76 +1,7 @@
 import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { age } from '../engine/age.js';
-import { STOPS } from '../engine/palette.js';
-
-/* OKLab interpolation helpers */
-function hexToRgb(hex) {
-  const n = parseInt(hex.slice(1), 16);
-  return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255];
-}
-
-function rgbToOklab(r, g, b) {
-  const lr = r > 0.04045 ? Math.pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
-  const lg = g > 0.04045 ? Math.pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
-  const lb = b > 0.04045 ? Math.pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
-  const l = Math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb);
-  const m = Math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb);
-  const s = Math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb);
-  return [
-    0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
-    1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
-    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s
-  ];
-}
-
-function oklabToRgb(L, a, b) {
-  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
-  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
-  const s_ = L - 0.0894841775 * a - 1.2914855480 * b;
-  const l = l_ * l_ * l_;
-  const m = m_ * m_ * m_;
-  const s = s_ * s_ * s_;
-  const lr = +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
-  const lg = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
-  const lb = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
-  const gamma = (c) => (c > 0.0031308 ? 1.055 * Math.pow(Math.max(0, c), 1 / 2.4) - 0.055 : 12.92 * Math.max(0, c));
-  return [
-    Math.min(1, Math.max(0, gamma(lr))),
-    Math.min(1, Math.max(0, gamma(lg))),
-    Math.min(1, Math.max(0, gamma(lb)))
-  ];
-}
-
-const OK_STOPS = STOPS.map((s) => ({
-  at: s.at,
-  bg: rgbToOklab(...hexToRgb(s.bg)),
-  fog: rgbToOklab(...hexToRgb(s.fog)),
-  fog2: rgbToOklab(...hexToRgb(s.fog2))
-}));
-
-function getBackgroundColorsAtAge(ageVal) {
-  const a = Math.max(0, Math.min(1, ageVal));
-  let i = 0;
-  while (i < OK_STOPS.length - 1 && OK_STOPS[i + 1].at < a) {
-    i++;
-  }
-  const s0 = OK_STOPS[i];
-  const s1 = OK_STOPS[Math.min(i + 1, OK_STOPS.length - 1)];
-  const range = s1.at - s0.at;
-  const t = range > 0.0001 ? (a - s0.at) / range : 0;
-
-  const lerp = (c0, c1) => [
-    c0[0] + (c1[0] - c0[0]) * t,
-    c0[1] + (c1[1] - c0[1]) * t,
-    c0[2] + (c1[2] - c0[2]) * t
-  ];
-
-  return {
-    bg: oklabToRgb(...lerp(s0.bg, s1.bg)),
-    fog: oklabToRgb(...lerp(s0.fog, s1.fog)),
-    fog2: oklabToRgb(...lerp(s0.fog2, s1.fog2))
-  };
-}
+import { getPalette } from '../engine/palette.js';
 
 const vertexShader = /* glsl */ `
   varying vec2 vUv;
@@ -202,7 +133,7 @@ export default function Background() {
     container.appendChild(renderer.domElement);
 
     const startTime = performance.now();
-    const initialColors = getBackgroundColorsAtAge(age.value);
+    const initialPalette = getPalette(age.value);
 
     const material = new THREE.ShaderMaterial({
       vertexShader,
@@ -212,9 +143,9 @@ export default function Background() {
         uAge: { value: age.value },
         uHorizonHeight: { value: 0.08 + 0.27 * age.value },
         uResolution: { value: new THREE.Vector2(width, height) },
-        uColorBg: { value: new THREE.Vector3(...initialColors.bg) },
-        uColorFog: { value: new THREE.Vector3(...initialColors.fog) },
-        uColorFog2: { value: new THREE.Vector3(...initialColors.fog2) }
+        uColorBg: { value: new THREE.Vector3(initialPalette.bg.r, initialPalette.bg.g, initialPalette.bg.b) },
+        uColorFog: { value: new THREE.Vector3(initialPalette.fog.r, initialPalette.fog.g, initialPalette.fog.b) },
+        uColorFog2: { value: new THREE.Vector3(initialPalette.fog2.r, initialPalette.fog2.g, initialPalette.fog2.b) }
       },
       depthWrite: false,
       depthTest: false
@@ -246,11 +177,11 @@ export default function Background() {
       // Horizon height: ~0.08 at age 0, rising to ~0.35 at age 1
       material.uniforms.uHorizonHeight.value = 0.08 + 0.27 * age.value;
 
-      // Update colors in OKLab
-      const currentColors = getBackgroundColorsAtAge(age.value);
-      material.uniforms.uColorBg.value.set(...currentColors.bg);
-      material.uniforms.uColorFog.value.set(...currentColors.fog);
-      material.uniforms.uColorFog2.value.set(...currentColors.fog2);
+      // Update colors from OKLCH palette lock
+      const p = getPalette(age.value);
+      material.uniforms.uColorBg.value.set(p.bg.r, p.bg.g, p.bg.b);
+      material.uniforms.uColorFog.value.set(p.fog.r, p.fog.g, p.fog.b);
+      material.uniforms.uColorFog2.value.set(p.fog2.r, p.fog2.g, p.fog2.b);
 
       renderer.render(scene, camera);
     };

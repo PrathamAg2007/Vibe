@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { memo, useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
@@ -6,92 +6,40 @@ import { MeshSurfaceSampler } from 'three/addons/math/MeshSurfaceSampler.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { useGLTF } from '@react-three/drei';
 import { age } from '../engine/age.js';
-import { STOPS } from '../engine/palette.js';
+import { getPalette } from '../engine/palette.js';
+import {
+  registerControls,
+  unregisterControls,
+  registerAstronautTester,
+  unregisterAstronautTester
+} from '../engine/input.js';
+import { getLevel } from '../engine/audio.js';
 
 // 1. Preload GLB via useGLTF
 useGLTF.preload('/models/astronaut.glb');
 
 const PARTICLE_COUNT = 40000;
 
-/* OKLab interpolation helpers */
-function hexToRgb(hex) {
-  const n = parseInt(hex.slice(1), 16);
-  return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255];
-}
+// Preallocated color buffer to avoid per-frame allocations in render loop
+let lastCalculatedAge = -1;
+const preallocatedParticleColor = [0, 0, 0];
 
-function rgbToOklab(r, g, b) {
-  const lr = r > 0.04045 ? Math.pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
-  const lg = g > 0.04045 ? Math.pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
-  const lb = b > 0.04045 ? Math.pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
-  const l = Math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb);
-  const m = Math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb);
-  const s = Math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb);
-  return [
-    0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
-    1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
-    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s
-  ];
-}
-
-function oklabToRgb(L, a, b) {
-  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
-  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
-  const s_ = L - 0.0894841775 * a - 1.2914855480 * b;
-  const l = l_ * l_ * l_;
-  const m = m_ * m_ * m_;
-  const s = s_ * s_ * s_;
-  const lr = +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
-  const lg = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
-  const lb = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
-  const gamma = (c) => (c > 0.0031308 ? 1.055 * Math.pow(Math.max(0, c), 1 / 2.4) - 0.055 : 12.92 * Math.max(0, c));
-  return [
-    Math.min(1, Math.max(0, gamma(lr))),
-    Math.min(1, Math.max(0, gamma(lg))),
-    Math.min(1, Math.max(0, gamma(lb)))
-  ];
-}
-
-const OK_STOPS = STOPS.map((s) => ({
-  at: s.at,
-  bg: rgbToOklab(...hexToRgb(s.bg)),
-  particle: rgbToOklab(...hexToRgb(s.particle))
-}));
-
-function getPaletteAtAge(ageVal) {
-  const a = Math.max(0, Math.min(1, ageVal));
-  let i = 0;
-  while (i < OK_STOPS.length - 1 && OK_STOPS[i + 1].at < a) {
-    i++;
+function updateParticleColorAtAge(ageVal, targetVec3) {
+  if (Math.abs(ageVal - lastCalculatedAge) < 0.0001) {
+    targetVec3.set(preallocatedParticleColor[0], preallocatedParticleColor[1], preallocatedParticleColor[2]);
+    return;
   }
-  const s0 = OK_STOPS[i];
-  const s1 = OK_STOPS[Math.min(i + 1, OK_STOPS.length - 1)];
-  const range = s1.at - s0.at;
-  const t = range > 0.0001 ? (a - s0.at) / range : 0;
-
-  const bgOk = [
-    s0.bg[0] + (s1.bg[0] - s0.bg[0]) * t,
-    s0.bg[1] + (s1.bg[1] - s0.bg[1]) * t,
-    s0.bg[2] + (s1.bg[2] - s0.bg[2]) * t
-  ];
-  const particleOk = [
-    s0.particle[0] + (s1.particle[0] - s0.particle[0]) * t,
-    s0.particle[1] + (s1.particle[1] - s0.particle[1]) * t,
-    s0.particle[2] + (s1.particle[2] - s0.particle[2]) * t
-  ];
-
-  const bgRgb = oklabToRgb(...bgOk);
-  const particleRgb = oklabToRgb(...particleOk);
-
-  return {
-    bg: bgRgb,
-    particle: particleRgb
-  };
+  lastCalculatedAge = ageVal;
+  const p = getPalette(ageVal);
+  preallocatedParticleColor[0] = p.particle.r;
+  preallocatedParticleColor[1] = p.particle.g;
+  preallocatedParticleColor[2] = p.particle.b;
+  targetVec3.set(p.particle.r, p.particle.g, p.particle.b);
 }
 
-// 2. Module-level cached geometry to ensure computing & sampling runs ONCE
+// 2. Module-level cached geometry to ensure computing & sampling runs ONCE across StrictMode
 let cachedGeometry = null;
 let geometryPromise = null;
-let activeInstances = 0;
 
 function getOrSampleGeometry() {
   if (cachedGeometry) {
@@ -110,10 +58,28 @@ function getOrSampleGeometry() {
         gltf.scene.updateMatrixWorld(true);
 
         gltf.scene.traverse((child) => {
-          if (child.isMesh && child.geometry) {
-            const cloned = child.geometry.clone();
-            cloned.applyMatrix4(child.matrixWorld);
-            geometries.push(cloned);
+          if (child.isMesh) {
+            if (child.material) {
+              const materials = Array.isArray(child.material) ? child.material : [child.material];
+              materials.forEach((mat) => {
+                [
+                  'map', 'roughnessMap', 'metalnessMap', 'normalMap',
+                  'bumpMap', 'displacementMap', 'alphaMap', 'aoMap',
+                  'emissiveMap', 'lightMap', 'envMap'
+                ].forEach((mapProp) => {
+                  if (mat[mapProp]) {
+                    mat[mapProp].dispose();
+                    mat[mapProp] = null;
+                  }
+                });
+                mat.dispose();
+              });
+            }
+            if (child.geometry) {
+              const cloned = child.geometry.clone();
+              cloned.applyMatrix4(child.matrixWorld);
+              geometries.push(cloned);
+            }
           }
         });
 
@@ -212,6 +178,8 @@ const vertexShader = /* glsl */ `
   uniform float uAssemble;
   uniform float uNod;
   uniform vec3 uParticleColor;
+  uniform float uAudio;
+  uniform float uModelHeight;
 
   attribute vec3 aScatter;
   attribute vec3 aNormal;
@@ -287,52 +255,66 @@ const vertexShader = /* glsl */ `
   }
 
   void main() {
-    // 1. Assembled model motion (age drift, sag, and nod)
-    vec3 noiseCoord = position * 0.40 + vec3(uTime * 0.16) + aRandom * 1.5;
-    vec3 noiseVec = vec3(
-      snoise(noiseCoord),
-      snoise(noiseCoord + vec3(43.12)),
-      snoise(noiseCoord + vec3(117.73))
-    );
+    // 1. Assembled model motion (age drift, sag, and nod) - only computed when assembling / assembled
+    vec3 assembledPos = position;
+    if (uAssemble > 0.0001) {
+      vec3 noiseCoord = position * 0.40 + vec3(uTime * 0.16) + aRandom * 1.5;
+      vec3 noiseVec = vec3(
+        snoise(noiseCoord),
+        snoise(noiseCoord + vec3(43.12)),
+        snoise(noiseCoord + vec3(117.73))
+      );
 
-    vec3 driftMotion = noiseVec + vec3(0.0, 0.20, 0.0);
+      vec3 driftMotion = noiseVec + vec3(0.0, 0.20, 0.0);
 
-    float age0Amp = 0.201 * aWander;
-    float age1Amp = 0.012;
-    float currentAmp = mix(age0Amp, age1Amp, uAge);
+      float age0Amp = 0.201 * aWander;
+      float age1Amp = 0.012;
+      float currentAmp = mix(age0Amp, age1Amp, uAge);
 
-    vec3 assembledPos = position + driftMotion * currentAmp;
+      assembledPos = position + driftMotion * currentAmp;
 
-    // Downward sag on lower body at age 1
-    float lowerBodySag = smoothstep(0.3, -1.6, position.y);
-    float sag = uAge * 0.10 * lowerBodySag;
-    assembledPos.y -= sag;
+      // Downward sag on lower body at age 1
+      float lowerBodySag = smoothstep(0.3, -1.6, position.y);
+      float sag = uAge * 0.10 * lowerBodySag;
+      assembledPos.y -= sag;
 
-    // Slow nod (pitch forward around neck pivot)
-    if (uNod > 0.0001) {
-      float nodWeight = smoothstep(0.0, 1.6, assembledPos.y);
-      float angle = uNod * nodWeight;
-      float cosA = cos(angle);
-      float sinA = sin(angle);
-      float py = assembledPos.y - 0.7;
-      float pz = assembledPos.z;
-      assembledPos.y = 0.7 + (py * cosA - pz * sinA);
-      assembledPos.z = py * sinA + pz * cosA;
+      // Slow nod (pitch forward around neck pivot)
+      if (uNod > 0.0001) {
+        float nodWeight = smoothstep(0.0, 1.6, assembledPos.y);
+        float angle = uNod * nodWeight;
+        float cosA = cos(angle);
+        float sinA = sin(angle);
+        float py = assembledPos.y - 0.7;
+        float pz = assembledPos.z;
+        assembledPos.y = 0.7 + (py * cosA - pz * sinA);
+        assembledPos.z = py * sinA + pz * cosA;
+      }
     }
 
     // 2. Scattered state (before entry, almost still)
     vec3 scatterCoord = aScatter * 0.25 + vec3(uTime * 0.03) + aRandom * 0.5;
-    vec3 scatterNoise = vec3(
-      snoise(scatterCoord),
-      snoise(scatterCoord + vec3(23.4)),
-      snoise(scatterCoord + vec3(54.1))
-    );
+    vec3 scatterNoise;
+    if (uAssemble == 0.0) {
+      // Exactly 2 octaves / noise evaluations while scattered at the gate screen
+      float n1 = snoise(scatterCoord);
+      float n2 = snoise(scatterCoord + vec3(23.4));
+      scatterNoise = vec3(n1, n2, n1 * 0.5 - n2 * 0.5);
+    } else {
+      scatterNoise = vec3(
+        snoise(scatterCoord),
+        snoise(scatterCoord + vec3(23.4)),
+        snoise(scatterCoord + vec3(54.1))
+      );
+    }
     vec3 scatteredPos = aScatter + scatterNoise * 0.04;
 
     // Assembly interpolation: 0 to 1 with slight natural particle stagger
     float stagger = aRandom.x * 0.25;
     float assembleT = smoothstep(stagger, stagger + 0.75, uAssemble);
     vec3 finalPos = mix(scatteredPos, assembledPos, assembleT);
+
+    // Subtle outward pulse: ~1.5% of model height * uAudio when assembled
+    finalPos += aNormal * (0.015 * uModelHeight * uAudio * assembleT);
 
     // 3. Shading: directional light (top-left-front) + faint rim term + per-particle brightness
     vec3 normalView = normalize(normalMatrix * aNormal);
@@ -344,17 +326,19 @@ const vertexShader = /* glsl */ `
     float ambient = 0.38;
     float modelLight = (ambient + 0.62 * diff + 0.22 * rim) * aBrightness;
     float lightIntensity = mix(0.85 * aBrightness, modelLight, assembleT);
+    lightIntensity *= (1.0 + 0.22 * uAudio);
 
     // Particle color comes from palette uniform (interpolated in OKLab)
     vColor = uParticleColor * lightIntensity;
     vAlpha = mix(0.93, 0.98, uAge);
 
-    // 4. Projection & size attenuation
     vec4 mvPosition = modelViewMatrix * vec4(finalPos, 1.0);
     gl_Position = projectionMatrix * mvPosition;
 
-    float basePx = mix(3.0, 2.0, uAge) * aSizeMult;
-    gl_PointSize = max(1.0, basePx * (uBaseDistance / -mvPosition.z) * uPixelRatio);
+    // 1. Particle size: ~3px at age 0, ~2px at age 1 at 1080p, with per-particle size variation
+    float targetPx = mix(3.0, 2.0, uAge) * aSizeMult * (1.0 + 0.35 * uAudio);
+    float dist = -mvPosition.z;
+    gl_PointSize = (targetPx * (uBaseDistance / dist)) * (uPixelRatio / 1.5);
   }
 `;
 
@@ -363,17 +347,19 @@ const fragmentShader = /* glsl */ `
   varying float vAlpha;
 
   void main() {
-    vec2 coord = gl_PointCoord - vec2(0.5);
-    float dist = length(coord);
-    if (dist > 0.5) discard;
+    // 2. Round point with narrow soft edge only (smoothstep between 0.42 and 0.5 on distance from centre)
+    float dist = length(gl_PointCoord - vec2(0.5));
+    if (dist > 0.5) {
+      discard;
+    }
+    float edgeAlpha = 1.0 - smoothstep(0.42, 0.5, dist);
 
-    // Round point with narrow soft edge only (smoothstep between 0.42 and 0.5)
-    float edge = 1.0 - smoothstep(0.42, 0.5, dist);
-    gl_FragColor = vec4(vColor, edge * vAlpha);
+    // Opaque-ish, normal blending, NOT additive
+    gl_FragColor = vec4(vColor, vAlpha * edgeAlpha);
   }
 `;
 
-export default function AstronautParticles({ hasEntered = false, onReady }) {
+function AstronautParticles({ hasEntered = false, onReady }) {
   const mountRef = useRef(null);
   const hasEnteredRef = useRef(hasEntered);
   const assembleStartTimeRef = useRef(null);
@@ -394,7 +380,6 @@ export default function AstronautParticles({ hasEntered = false, onReady }) {
     const container = mountRef.current;
     if (!container) return;
 
-    activeInstances++;
     let animationFrameId;
     let isDisposed = false;
     let firstFrameFired = false;
@@ -408,49 +393,106 @@ export default function AstronautParticles({ hasEntered = false, onReady }) {
     const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
     camera.position.set(0, 0, 6.5);
 
+    // 5. Canvas: gl={{ antialias: false, powerPreference: 'high-performance' }}
     const renderer = new THREE.WebGLRenderer({
-      antialias: true,
+      antialias: false,
       alpha: true,
       powerPreference: 'high-performance'
     });
     renderer.setSize(width, height);
-    // 5. Cap devicePixelRatio at 1.5
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    // dpr={[1, 1.5]}
+    const dpr = Math.min(Math.max(window.devicePixelRatio || 1, 1), 1.5);
+    renderer.setPixelRatio(dpr);
     renderer.setClearColor(0x000000, 0);
     container.appendChild(renderer.domElement);
 
-    // 2. OrbitControls with slow auto-rotation
+    // 2. OrbitControls with slow auto-rotation, zoom & pan disabled
+    // Default enabled = false (enabled ONLY while pointer press owner is 'astronaut')
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
     controls.autoRotate = true;
     controls.autoRotateSpeed = 0.5;
+    controls.enableZoom = false;
+    controls.enablePan = false;
     controls.minDistance = 2.0;
     controls.maxDistance = 14.0;
     controls.target.set(0, 0, 0);
+    controls.enabled = false;
     controls.update();
 
-    // 3. Shader material with uAssemble, uNod, and uParticleColor
-    const initialPalette = getPaletteAtAge(age.value);
-    const startTime = performance.now();
+    registerControls(controls);
 
+    // Astronaut screen-space region tester (projected bounding box shrunk by 10%, ellipse test)
+    const corners = [
+      new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(),
+      new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()
+    ];
+    const scratchProj = new THREE.Vector3();
+
+    function isPointInsideAstronaut(px, py) {
+      if (isDisposed || !geometry || !geometry.boundingBox || !camera) return false;
+      const min = geometry.boundingBox.min;
+      const max = geometry.boundingBox.max;
+
+      corners[0].set(min.x, min.y, min.z);
+      corners[1].set(max.x, min.y, min.z);
+      corners[2].set(min.x, max.y, min.z);
+      corners[3].set(max.x, max.y, min.z);
+      corners[4].set(min.x, min.y, max.z);
+      corners[5].set(max.x, min.y, max.z);
+      corners[6].set(min.x, max.y, max.z);
+      corners[7].set(max.x, max.y, max.z);
+
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+
+      let minX = Infinity, maxX = -Infinity;
+      let minY = Infinity, maxY = -Infinity;
+
+      for (let i = 0; i < 8; i++) {
+        scratchProj.copy(corners[i]).project(camera);
+        const sx = (scratchProj.x * 0.5 + 0.5) * w;
+        const sy = (-scratchProj.y * 0.5 + 0.5) * h;
+        if (sx < minX) minX = sx;
+        if (sx > maxX) maxX = sx;
+        if (sy < minY) minY = sy;
+        if (sy > maxY) maxY = sy;
+      }
+
+      const cx = (minX + maxX) * 0.5;
+      const cy = (minY + maxY) * 0.5;
+      const rx = (maxX - minX) * 0.5 * 0.90; // shrunk by about 10 percent
+      const ry = (maxY - minY) * 0.5 * 0.90;
+
+      if (rx <= 0 || ry <= 0) return false;
+
+      const dx = px - cx;
+      const dy = py - cy;
+      return (dx * dx) / (rx * rx) + (dy * dy) / (ry * ry) <= 1.0;
+    }
+
+    registerAstronautTester(isPointInsideAstronaut);
+
+    // 3. Shader material with uAssemble, uNod, and uParticleColor
+    const startTime = performance.now();
+    const initialColor = new THREE.Vector3();
+    updateParticleColorAtAge(age.value, initialColor);
+
+    // Points material: depthWrite: false
     const material = new THREE.ShaderMaterial({
       vertexShader,
       fragmentShader,
       uniforms: {
         uTime: { value: 0.0 },
         uAge: { value: age.value },
-        uPixelRatio: { value: Math.min(window.devicePixelRatio, 1.5) },
+        uPixelRatio: { value: dpr },
         uBaseDistance: { value: 6.5 },
         uAssemble: { value: hasEnteredRef.current ? 1.0 : 0.0 },
         uNod: { value: 0.0 },
-        uParticleColor: {
-          value: new THREE.Vector3(
-            initialPalette.particle[0],
-            initialPalette.particle[1],
-            initialPalette.particle[2]
-          )
-        }
+        uParticleColor: { value: initialColor },
+        uAudio: { value: 0.0 },
+        uModelHeight: { value: 2.2 }
       },
       transparent: true,
       depthTest: true,
@@ -460,6 +502,7 @@ export default function AstronautParticles({ hasEntered = false, onReady }) {
 
     let pointsObject = null;
     let geometry = null;
+    const preallocatedBoxSize = new THREE.Vector3();
 
     // Load or retrieve precomputed geometry
     getOrSampleGeometry()
@@ -468,56 +511,50 @@ export default function AstronautParticles({ hasEntered = false, onReady }) {
         geometry = geo;
 
         // Fit camera distance from bounding box
-        const box = geo.boundingBox;
-        const boxSize = new THREE.Vector3();
-        box.getSize(boxSize);
+        if (geometry.boundingBox) {
+          geometry.boundingBox.getSize(preallocatedBoxSize);
+          const fovRad = (camera.fov * Math.PI) / 180;
+          const fovTan = Math.tan(fovRad / 2);
+          const dV = (preallocatedBoxSize.y / 2) / fovTan * 1.35;
+          const dH = (preallocatedBoxSize.x / 2) / (fovTan * camera.aspect) * 1.35;
+          const fitDist = Math.max(dV, dH);
+          camera.position.set(0, 0, fitDist);
+          controls.minDistance = fitDist * 0.5;
+          controls.maxDistance = fitDist * 2.5;
+          controls.update();
+          material.uniforms.uBaseDistance.value = fitDist;
+          material.uniforms.uModelHeight.value = preallocatedBoxSize.y;
+        }
 
-        const fovRad = (camera.fov * Math.PI) / 180;
-        const fovTan = Math.tan(fovRad / 2);
-        const aspect = camera.aspect || width / height;
-        const marginFactor = 1.35;
-
-        const distVert = (boxSize.y / 2) / fovTan * marginFactor;
-        const distHoriz = (boxSize.x / 2) / (fovTan * aspect) * marginFactor;
-        const fitDistance = Math.max(distVert, distHoriz);
-
-        camera.position.set(0, 0, fitDistance);
-        camera.lookAt(0, 0, 0);
-        controls.target.set(0, 0, 0);
-        controls.minDistance = fitDistance * 0.4;
-        controls.maxDistance = fitDistance * 2.5;
-        controls.update();
-
-        material.uniforms.uBaseDistance.value = fitDistance;
-
-        pointsObject = new THREE.Points(geo, material);
+        pointsObject = new THREE.Points(geometry, material);
+        pointsObject.matrixAutoUpdate = false;
+        pointsObject.frustumCulled = false;
         scene.add(pointsObject);
       })
       .catch((err) => {
-        console.error('Failed to load astronaut geometry:', err);
+        if (!isDisposed) {
+          console.error('Failed to load particle geometry:', err);
+        }
       });
 
-    // 4. Handle resizing
+    // Handle resize
     const onResize = () => {
-      if (!container) return;
+      if (isDisposed || !container) return;
       const w = container.clientWidth || window.innerWidth;
       const h = container.clientHeight || window.innerHeight;
-
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
-
       renderer.setSize(w, h);
-      const pr = Math.min(window.devicePixelRatio, 1.5);
+      const pr = Math.min(Math.max(window.devicePixelRatio || 1, 1), 1.5);
       renderer.setPixelRatio(pr);
       material.uniforms.uPixelRatio.value = pr;
 
       if (geometry && geometry.boundingBox) {
-        const boxSize = new THREE.Vector3();
-        geometry.boundingBox.getSize(boxSize);
+        geometry.boundingBox.getSize(preallocatedBoxSize);
         const fovRad = (camera.fov * Math.PI) / 180;
         const fovTan = Math.tan(fovRad / 2);
-        const dV = (boxSize.y / 2) / fovTan * 1.35;
-        const dH = (boxSize.x / 2) / (fovTan * camera.aspect) * 1.35;
+        const dV = (preallocatedBoxSize.y / 2) / fovTan * 1.35;
+        const dH = (preallocatedBoxSize.x / 2) / (fovTan * camera.aspect) * 1.35;
         const fitDist = Math.max(dV, dH);
         material.uniforms.uBaseDistance.value = fitDist;
       }
@@ -525,21 +562,18 @@ export default function AstronautParticles({ hasEntered = false, onReady }) {
 
     window.addEventListener('resize', onResize);
 
-    // 5. Animation loop: 60fps, no React state allocations on frame
+    // 4. Exactly one animation loop: check isDisposed at top, no allocations
     const animate = () => {
+      if (isDisposed) return;
       animationFrameId = requestAnimationFrame(animate);
 
       const currentTime = performance.now();
       material.uniforms.uTime.value = (currentTime - startTime) * 0.001;
       material.uniforms.uAge.value = age.value;
+      material.uniforms.uAudio.value = getLevel();
 
-      // Update particle color from OKLab interpolated palette
-      const currentPal = getPaletteAtAge(age.value);
-      material.uniforms.uParticleColor.value.set(
-        currentPal.particle[0],
-        currentPal.particle[1],
-        currentPal.particle[2]
-      );
+      // Update particle color via in-place mutation without allocations
+      updateParticleColorAtAge(age.value, material.uniforms.uParticleColor.value);
 
       // Handle assembly & slow nod
       if (assembleStartTimeRef.current !== null) {
@@ -562,7 +596,7 @@ export default function AstronautParticles({ hasEntered = false, onReady }) {
       controls.update();
       renderer.render(scene, camera);
 
-      // 3. Notify ready after particle geometry is present and first frame has rendered
+      // Notify ready after particle geometry is present and first frame has rendered
       if (!firstFrameFired && pointsObject) {
         firstFrameFired = true;
         if (onReadyRef.current) {
@@ -573,25 +607,20 @@ export default function AstronautParticles({ hasEntered = false, onReady }) {
 
     animate();
 
-    // 6. Cleanup on unmount
+    // Cleanup on unmount
     return () => {
       isDisposed = true;
-      activeInstances--;
       cancelAnimationFrame(animationFrameId);
       window.removeEventListener('resize', onResize);
 
+      unregisterControls();
+      unregisterAstronautTester();
       controls.dispose();
       material.dispose();
 
       if (pointsObject) {
         scene.remove(pointsObject);
-      }
-
-      // Dispose cached geometry when no active instances remain
-      if (activeInstances <= 0 && cachedGeometry) {
-        cachedGeometry.dispose();
-        cachedGeometry = null;
-        geometryPromise = null;
+        pointsObject = null;
       }
 
       renderer.dispose();
@@ -603,7 +632,9 @@ export default function AstronautParticles({ hasEntered = false, onReady }) {
 
   return (
     <div className="relative w-full h-full min-h-screen overflow-hidden select-none bg-[var(--page-bg)]">
-      <div ref={mountRef} className="absolute inset-0 w-full h-full cursor-grab active:cursor-grabbing" />
+      <div ref={mountRef} className="absolute inset-0 w-full h-full" />
     </div>
   );
 }
+
+export default memo(AstronautParticles);
