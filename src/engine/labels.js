@@ -1,6 +1,6 @@
 import Matter from 'matter-js';
 import { getPalette } from './palette.js';
-import { getLenis } from './scroll.js';
+import { getLenis, getScrollVelocity } from './scroll.js';
 
 const { Bodies, Body, Composite } = Matter;
 
@@ -140,24 +140,21 @@ export function createLabelsManager(engine, canvas, initialWidth, initialHeight)
   // State per stage
   const stageStates = {
     child: {
-      fadeTime: 0,
-      alpha: 0,
+      fadeTimer: 0,
       shattered: false,
       shatterTimer: 0,
       reassembling: false,
       reassembleTimer: 0
     },
     teen: {
-      fadeTime: 0,
-      alpha: 0,
+      fadeTimer: 0,
       shattered: false,
       shatterTimer: 0,
       reassembling: false,
       reassembleTimer: 0
     },
     adult: {
-      fadeTime: 0,
-      alpha: 0,
+      fadeTimer: 0,
       shattered: false,
       shatterTimer: 0,
       reassembling: false,
@@ -165,9 +162,12 @@ export function createLabelsManager(engine, canvas, initialWidth, initialHeight)
     }
   };
 
-  let lowVelocityDuration = 0;
+  let highSpeedDuration = 0;
+  let lowSpeedDuration = 0;
+  let lastVelocityShatterTime = -9999;
   let isVelocityShattered = false;
   let velocityShatteredStage = null;
+  let prevAge = null;
 
   function remeasureAndRebuild() {
     if (!fontsReady) return;
@@ -417,42 +417,115 @@ export function createLabelsManager(engine, canvas, initialWidth, initialHeight)
       });
     });
 
-    // 3. Shatter triggers
-    if (currentAge >= 0.75) {
-      if (!stageStates.adult.shattered && !stageStates.adult.reassembling) {
-        triggerShatter('adult');
+    // 3. Child & teen labels never shatter on a stage change.
+    // When a stage ends, words stay on home positions with collisions off while fading out.
+    ['child', 'teen'].forEach((st) => {
+      if (st !== activeStage) {
+        const state = stageStates[st];
+        if (state.shattered || state.reassembling) {
+          state.shattered = false;
+          state.reassembling = false;
+          stageWords[st].forEach((w) => {
+            const b = w.body;
+            b.collisionFilter.category = 0x0000;
+            b.collisionFilter.mask = 0x0000;
+            b.collisionFilter.group = -1;
+            Body.setVelocity(b, { x: 0, y: 0 });
+            Body.setAngularVelocity(b, 0);
+            Body.setPosition(b, { x: w.hx, y: w.hy });
+            Body.setAngle(b, w.hRot);
+          });
+        }
+        if (velocityShatteredStage === st) {
+          isVelocityShattered = false;
+          velocityShatteredStage = null;
+          lowSpeedDuration = 0;
+        }
       }
-    } else if (currentAge < 0.72) {
-      if (stageStates.adult.shattered) {
-        triggerReassembly('adult');
+    });
+
+    // 4. Adult label shatters ONLY when age crosses 0.75 upward (once),
+    // and reassembles when age drops below 0.72.
+    if (prevAge !== null) {
+      if (prevAge < 0.75 && currentAge >= 0.75) {
+        if (!stageStates.adult.shattered) {
+          triggerShatter('adult');
+        }
+      } else if (currentAge < 0.72) {
+        if (stageStates.adult.shattered) {
+          triggerReassembly('adult');
+        }
+      }
+    }
+    prevAge = currentAge;
+
+    // 5. Velocity shatter calculation & triggers
+    // Compute speed = abs(lenis.velocity) in px/s, require speed > 2.5 * viewportHeight sustained for >= 150ms.
+    // Add 4s cooldown after any velocity shatter.
+    const lenis = getLenis();
+    let speed = 0;
+    if (lenis) {
+      if (typeof getScrollVelocity === 'function' && typeof lenis.velocityPxPerSec === 'number') {
+        speed = Math.abs(lenis.velocityPxPerSec);
+      } else {
+        const rawVel = typeof lenis.velocity === 'number' ? Math.abs(lenis.velocity) : 0;
+        const dtSafe = Math.max(0.001, dt);
+        speed = (rawVel > 2.5 * height) ? rawVel : (rawVel / dtSafe);
       }
     }
 
-    const lenis = getLenis();
-    const vel = lenis ? Math.abs(lenis.velocity) : 0;
-    if (vel > 3.8) {
-      lowVelocityDuration = 0;
-      if (!isVelocityShattered) {
-        isVelocityShattered = true;
-        velocityShatteredStage = activeStage;
+    const nowSec = performance.now() * 0.001;
+
+    if (speed > 2.5 * height) {
+      highSpeedDuration += dt;
+    } else {
+      highSpeedDuration = 0;
+    }
+
+    if (highSpeedDuration >= 0.150 && (nowSec - lastVelocityShatterTime >= 4.0)) {
+      console.log('[shatter] velocity', speed);
+      lastVelocityShatterTime = nowSec;
+      highSpeedDuration = 0;
+      lowSpeedDuration = 0;
+      isVelocityShattered = true;
+      velocityShatteredStage = activeStage;
+      if (!stageStates[activeStage].shattered) {
         triggerShatter(activeStage);
       }
-    } else if (vel <= 1.5) {
-      lowVelocityDuration += dt;
-      if (isVelocityShattered && lowVelocityDuration >= 1.2) {
-        isVelocityShattered = false;
-        if (velocityShatteredStage && (velocityShatteredStage !== 'adult' || currentAge < 0.75)) {
-          triggerReassembly(velocityShatteredStage);
-        }
-        velocityShatteredStage = null;
-      }
     }
 
-    // 4. Update state & physics per word
+    // Reassembly after a velocity shatter happens only after speed stays under 0.5 * viewportHeight for 1.2 s
+    if (isVelocityShattered) {
+      if (speed < 0.5 * height) {
+        lowSpeedDuration += dt;
+        if (lowSpeedDuration >= 1.2) {
+          isVelocityShattered = false;
+          lowSpeedDuration = 0;
+          if (velocityShatteredStage) {
+            if (velocityShatteredStage !== 'adult' || currentAge < 0.75) {
+              triggerReassembly(velocityShatteredStage);
+            }
+            velocityShatteredStage = null;
+          }
+        }
+      } else {
+        lowSpeedDuration = 0;
+      }
+    } else {
+      lowSpeedDuration = 0;
+    }
+
+    // 6. Update state & physics per word
     ['child', 'teen', 'adult'].forEach((st) => {
       const state = stageStates[st];
       const isTarget = (st === activeStage);
       const words = stageWords[st];
+
+      if (isTarget) {
+        state.fadeTimer = Math.min(0.8, state.fadeTimer + dt);
+      } else {
+        state.fadeTimer = Math.max(0, state.fadeTimer - dt);
+      }
 
       if (state.shattered) {
         state.shatterTimer += dt;
@@ -463,16 +536,17 @@ export function createLabelsManager(engine, canvas, initialWidth, initialHeight)
         }
       }
 
+      const wordFadeDuration = 0.44;
       words.forEach((w) => {
-        if (isTarget) {
-          w.fadeTime = Math.min(0.8, w.fadeTime + dt);
-        } else {
-          w.fadeTime = Math.max(0, w.fadeTime - dt);
-        }
-
         const stagger = w.wordIndex * 0.040;
-        const p = Math.max(0, Math.min(1, (w.fadeTime - stagger) / Math.max(0.001, 0.8 - stagger)));
-        w.alpha = isTarget ? easeOutCubic(p) : easeInOutCubic(p);
+        if (isTarget) {
+          const pIn = Math.max(0, Math.min(1, (state.fadeTimer - stagger) / wordFadeDuration));
+          w.alpha = easeOutCubic(pIn);
+        } else {
+          const fadeOutElapsed = 0.8 - state.fadeTimer;
+          const pOut = Math.max(0, Math.min(1, (fadeOutElapsed - stagger) / wordFadeDuration));
+          w.alpha = easeInOutCubic(1 - pOut);
+        }
 
         if (w.wobbleActive) {
           w.wobbleTime += dt;
@@ -502,7 +576,7 @@ export function createLabelsManager(engine, canvas, initialWidth, initialHeight)
           Body.setAngle(b, curRot);
           Body.setVelocity(b, { x: 0, y: 0 });
           Body.setAngularVelocity(b, 0);
-        } else if (state.shattered) {
+        } else if (state.shattered && isTarget) {
           const tether = Math.max(0, 1.0 - state.shatterTimer / 0.3);
           if (tether > 0.001) {
             const dx = w.hx - b.position.x;
@@ -517,7 +591,10 @@ export function createLabelsManager(engine, canvas, initialWidth, initialHeight)
             Body.applyForce(b, b.position, { x: 0, y: downG });
           }
         } else {
-          // Intact state: snap to home positions exactly
+          // Intact or non-target state: snap to home positions exactly with collisions off
+          b.collisionFilter.category = 0x0000;
+          b.collisionFilter.mask = 0x0000;
+          b.collisionFilter.group = -1;
           Body.setPosition(b, { x: w.hx, y: w.hy });
           Body.setAngle(b, w.hRot);
           Body.setVelocity(b, { x: 0, y: 0 });

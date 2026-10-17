@@ -11,6 +11,7 @@ let tickerCallback = null;
 let targetAge = 0;
 let ageCounterEl = null;
 let hasEntered = false;
+let scrollVelocity = 0;
 
 export function lockScroll() {
   if (lenisInstance) {
@@ -37,6 +38,18 @@ export function getLenis() {
   return lenisInstance;
 }
 
+export function setLenis(instance) {
+  lenisInstance = instance;
+}
+
+export function getScrollVelocity() {
+  return scrollVelocity;
+}
+
+export function setScrollVelocity(v) {
+  scrollVelocity = v;
+}
+
 export function getTargetAge() {
   return targetAge;
 }
@@ -56,6 +69,7 @@ export function destroyScroll() {
     lenisInstance.destroy();
     lenisInstance = null;
   }
+  scrollVelocity = 0;
   ageCounterEl = null;
 }
 
@@ -107,13 +121,17 @@ export function initScroll(spacerElement, counterElement) {
 
   let lastTime = performance.now();
   tickerCallback = (time) => {
-    if (lenisInstance) {
-      lenisInstance.raf(time * 1000);
-    }
-
     const now = performance.now();
     const dt = Math.min((now - lastTime) * 0.001, 0.1);
     lastTime = now;
+
+    if (lenisInstance) {
+      lenisInstance.raf(time * 1000);
+      scrollVelocity = dt > 0 ? (lenisInstance.velocity / dt) : 0;
+      lenisInstance.velocityPxPerSec = scrollVelocity;
+    } else {
+      scrollVelocity = 0;
+    }
 
     // Until the gate has been entered, targetAge must stay 0 and age.value must be 0
     if (!hasEntered) {
